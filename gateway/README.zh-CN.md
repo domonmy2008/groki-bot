@@ -292,6 +292,12 @@ curl -s -X POST http://127.0.0.1:18770/send \
 | `STACKCHAN_GEMINI_MODEL` | `gemini-3.8-live` | Gemini Live 模型（改回 `gemini-3.1-flash-live-preview` 即可退回） |
 | `STACKCHAN_TOKEN` | 空 | 与机器人共享的密码，同时保护 `/capture` 和 `/debug/inject-text` |
 | `HOST`、`WS_PORT`、`CAPTURE_PORT` | `0.0.0.0`、`8765`、`8766` | 监听地址和端口 |
+| `STACKCHAN_WS_PING_INTERVAL` | `60` | 设备 WebSocket 的 ping 间隔（秒）。`0` 表示不发送 ping |
+| `STACKCHAN_WS_PING_TIMEOUT` | `60` | 等多久收不到 pong 就关闭设备连接（关闭码 1011）。`0` 表示一直等 |
+| `STACKCHAN_WS_MAX_QUEUE` | `128` | 入站帧堆积到多少后暂停从 socket 读取。`0` 表示不限制 |
+| `STACKCHAN_HELLO_VOICE_WAIT_S` | `2` | hello 最多等待语音连接的秒数，超时后先回复，其余连接在后台继续 |
+| `STACKCHAN_UPLINK_PREROLL_FRAMES` | `400` | 语音尚未连上时保留的 Opus 帧数。`0` 表示全部保留 |
+| `STACKCHAN_TTS_REPLAY_TTL_S` | `45` | 设备连接已关闭、没能播出的音频，在重连后保留并重放的秒数。`0` 关闭重放 |
 | `STACKCHAN_WAKE_WORD` | 开 | 设为 `0` 关闭唤醒词 |
 | `STACKCHAN_KWS_SCORE` | `7` | 越高越容易唤醒 |
 | `STACKCHAN_KWS_THRESHOLD` | `0.05` | 越低越灵敏 |

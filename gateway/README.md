@@ -400,6 +400,12 @@ reconnect the MCP client, after a change).
 | `STACKCHAN_GEMINI_MODEL` | `gemini-3.8-live` | Gemini Live model (set `gemini-3.1-flash-live-preview` to go back) |
 | `STACKCHAN_TOKEN` | empty | Shared secret with the robot; also protects `/capture` and `/debug/inject-text` |
 | `HOST`, `WS_PORT`, `CAPTURE_PORT` | `0.0.0.0`, `8765`, `8766` | Listen address and ports |
+| `STACKCHAN_WS_PING_INTERVAL` | `60` | Device WebSocket ping interval in seconds. `0` disables pings |
+| `STACKCHAN_WS_PING_TIMEOUT` | `60` | Seconds to wait for a pong before closing the device socket (close code 1011). `0` waits indefinitely |
+| `STACKCHAN_WS_MAX_QUEUE` | `128` | Incoming frames buffered before the socket pauses reading. `0` disables that limit |
+| `STACKCHAN_HELLO_VOICE_WAIT_S` | `2` | How long hello may wait for voice connect before answering; the rest continues in the background |
+| `STACKCHAN_UPLINK_PREROLL_FRAMES` | `400` | Opus frames kept while voice is still connecting. `0` keeps every frame |
+| `STACKCHAN_TTS_REPLAY_TTL_S` | `45` | How long audio the device missed (socket already closed) is replayed after reconnect. `0` disables replay |
 | `STACKCHAN_WAKE_WORD` | on | `0` disables the wake word gate |
 | `STACKCHAN_KWS_SCORE` | `7` | Higher makes the wake word easier to trigger |
 | `STACKCHAN_KWS_THRESHOLD` | `0.05` | Lower makes the wake word more sensitive |

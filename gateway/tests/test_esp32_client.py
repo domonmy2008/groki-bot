@@ -2,13 +2,20 @@
 
 import asyncio
 import json
+import logging
 
 import pytest
 import pytest_asyncio
 import websockets
 
 from stackchan_mcp.audio_stream import SpeakResult
-from stackchan_mcp.esp32_client import ESP32Connection, ESP32Manager
+from stackchan_mcp.esp32_client import (
+    ESP32Connection,
+    ESP32Manager,
+    bracket_tts_payloads,
+    trim_pending_audio,
+    websocket_server_options,
+)
 
 
 @pytest_asyncio.fixture
@@ -428,7 +435,14 @@ async def test_ciniml_client_full_conversation_round_trip():
 
 @pytest.mark.asyncio
 async def test_esp32_server_hello_waits_for_cloud_proxy_start():
-    """Server hello is delayed until the cloud proxy is ready for wake audio."""
+    """Hello is not sent before voice start begins.
+
+    A still-blocked start used to hold the read loop until the upstream
+    socket was ready. The handler now waits only a short budget; this test
+    still checks that hello is not flushed in the first instant, and that
+    releasing a fast start lets hello through. The slow-start case is
+    covered separately.
+    """
 
     class DelayedCloudProxy:
         def __init__(self):
@@ -477,6 +491,246 @@ async def test_esp32_server_hello_waits_for_cloud_proxy_start():
             proxy.release.set()
             resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=1.0))
             assert resp["type"] == "hello"
+    finally:
+        await mgr.stop()
+
+
+def test_websocket_keepalive_defaults_and_env(monkeypatch):
+    """Device socket keepalive is explicit and at least 60s unless overridden."""
+    monkeypatch.delenv("STACKCHAN_WS_PING_INTERVAL", raising=False)
+    monkeypatch.delenv("STACKCHAN_WS_PING_TIMEOUT", raising=False)
+    monkeypatch.delenv("STACKCHAN_WS_MAX_QUEUE", raising=False)
+    options = websocket_server_options()
+    assert options["ping_interval"] >= 60
+    assert options["ping_timeout"] >= 60
+    assert options["max_queue"] >= 32
+
+    monkeypatch.setenv("STACKCHAN_WS_PING_INTERVAL", "90")
+    monkeypatch.setenv("STACKCHAN_WS_PING_TIMEOUT", "0")
+    monkeypatch.setenv("STACKCHAN_WS_MAX_QUEUE", "32")
+    options = websocket_server_options()
+    assert options["ping_interval"] == 90
+    assert options["ping_timeout"] is None
+    assert options["max_queue"] == 32
+
+
+@pytest.mark.asyncio
+async def test_serve_passes_keepalive_options(monkeypatch):
+    captured: dict = {}
+
+    class _Server:
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    async def fake_serve(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return _Server()
+
+    monkeypatch.delenv("STACKCHAN_WS_PING_INTERVAL", raising=False)
+    monkeypatch.delenv("STACKCHAN_WS_PING_TIMEOUT", raising=False)
+    monkeypatch.delenv("STACKCHAN_WS_MAX_QUEUE", raising=False)
+    monkeypatch.setattr("stackchan_mcp.esp32_client.websockets.serve", fake_serve)
+    mgr = ESP32Manager()
+    await mgr.start("127.0.0.1", 0)
+    await mgr.stop()
+    assert captured["kwargs"]["ping_interval"] == 60
+    assert captured["kwargs"]["ping_timeout"] == 60
+    assert captured["kwargs"]["max_queue"] == 128
+    assert captured["kwargs"]["process_request"].__func__ is ESP32Manager._check_auth
+
+
+def test_trim_pending_audio_drops_oldest_opus_and_keeps_json():
+    pending = [
+        ("bin", b"old"),
+        ("json", {"type": "listen"}),
+        ("bin", b"new"),
+    ]
+    dropped = trim_pending_audio(pending, 1)
+    assert dropped == 1
+    assert pending == [("json", {"type": "listen"}), ("bin", b"new")]
+    assert trim_pending_audio(pending, 0) == 0
+    assert len(pending) == 2
+
+
+def test_bracket_tts_payloads_adds_missing_stop():
+    payloads = bracket_tts_payloads(
+        [json.dumps({"type": "tts", "state": "start"}), b"opus"]
+    )
+    assert json.loads(payloads[0])["state"] == "start"
+    assert payloads[1] == b"opus"
+    assert json.loads(payloads[-1])["state"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_logs_close_code_and_reason(manager, caplog):
+    """A device close is logged with the code and reason, including 1011."""
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.esp32_client")
+    port = manager._test_port
+    ws = await websockets.connect(f"ws://127.0.0.1:{port}")
+    await ws.close(1011, "keepalive ping timeout")
+    for _ in range(40):
+        if any(
+            "1011" in record.message and "keepalive ping timeout" in record.message
+            for record in caplog.records
+        ):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        messages = [record.message for record in caplog.records]
+        pytest.fail(f"close code/reason missing from logs: {messages}")
+
+
+@pytest.mark.asyncio
+async def test_hello_does_not_wait_out_slow_voice_start(monkeypatch):
+    """Hello returns while voice start is still blocked, and early Opus is kept."""
+    monkeypatch.setenv("STACKCHAN_HELLO_VOICE_WAIT_S", "0.05")
+
+    class SlowProxy:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.frames: list[bytes] = []
+            self.jsons: list[dict] = []
+
+        async def start(self, info, device_hello, send_to_device):
+            self.started.set()
+            await self.release.wait()
+            return True
+
+        async def stop(self):
+            return None
+
+        async def try_handle_device_mcp(self, message):
+            return False
+
+        async def send_device_json(self, message):
+            self.jsons.append(message)
+            return True
+
+        async def send_device_binary(self, data):
+            self.frames.append(data)
+            return True
+
+    proxy = SlowProxy()
+    mgr = ESP32Manager(cloud_proxy_factory=lambda: proxy)
+    await mgr.start("127.0.0.1", 0)
+    port = mgr._server.sockets[0].getsockname()[1]
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+            await ws.send(json.dumps({
+                "type": "hello",
+                "version": 1,
+                "features": {"mcp": False},
+                "transport": "websocket",
+            }))
+            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=1.0))
+            assert resp["type"] == "hello"
+            assert not proxy.release.is_set()
+
+            await ws.send(json.dumps({"type": "listen", "state": "start", "mode": "auto"}))
+            await ws.send(b"frame-a")
+            await ws.send(b"frame-b")
+            await asyncio.sleep(0.05)
+            assert proxy.frames == []
+            assert proxy.jsons == []
+
+            proxy.release.set()
+            for _ in range(40):
+                if proxy.frames == [b"frame-a", b"frame-b"] and proxy.jsons:
+                    break
+                await asyncio.sleep(0.05)
+            assert proxy.jsons[0]["type"] == "listen"
+            assert proxy.frames == [b"frame-a", b"frame-b"]
+    finally:
+        proxy.release.set()
+        await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_undelivered_tts_replays_after_reconnect():
+    """Audio the closed socket never accepted is sent on the next hello."""
+
+    class HoldingProxy:
+        def __init__(self, payloads):
+            self._payloads = payloads
+
+        async def start(self, info, device_hello, send_to_device):
+            return True
+
+        async def stop(self):
+            return None
+
+        def take_undelivered_tts(self):
+            payloads, self._payloads = self._payloads, []
+            return payloads
+
+        async def try_handle_device_mcp(self, message):
+            return False
+
+        async def send_device_json(self, message):
+            return True
+
+        async def send_device_binary(self, data):
+            return True
+
+    created = {"n": 0}
+
+    def factory():
+        created["n"] += 1
+        if created["n"] == 1:
+            return HoldingProxy([
+                json.dumps({"type": "tts", "state": "start"}),
+                b"\x01\x02opus",
+            ])
+        return HoldingProxy([])
+
+    mgr = ESP32Manager(cloud_proxy_factory=factory)
+    await mgr.start("127.0.0.1", 0)
+    port = mgr._server.sockets[0].getsockname()[1]
+    headers = {"Device-Id": "desk-1"}
+    hello = {
+        "type": "hello",
+        "version": 1,
+        "features": {"mcp": False},
+        "transport": "websocket",
+    }
+    try:
+        async with websockets.connect(
+            f"ws://127.0.0.1:{port}",
+            additional_headers=headers,
+        ) as ws:
+            await ws.send(json.dumps(hello))
+            first = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            assert first["type"] == "hello"
+        for _ in range(40):
+            if mgr._undelivered_tts is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert mgr._undelivered_tts is not None
+
+        async with websockets.connect(
+            f"ws://127.0.0.1:{port}",
+            additional_headers=headers,
+        ) as ws:
+            await ws.send(json.dumps(hello))
+            seen = []
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while asyncio.get_running_loop().time() < deadline and len(seen) < 4:
+                seen.append(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            kinds = []
+            for item in seen:
+                if isinstance(item, bytes):
+                    kinds.append(item)
+                else:
+                    kinds.append(json.loads(item).get("type") if json.loads(item).get("type") != "tts"
+                                 else json.loads(item).get("state"))
+            assert "hello" in kinds
+            assert "start" in kinds
+            assert b"\x01\x02opus" in kinds
+            assert "stop" in kinds
     finally:
         await mgr.stop()
 
