@@ -199,6 +199,9 @@ class Gateway:
         """Voice-proxy hook: LISTENING may move; DORMANT homes and holds."""
         await self.idle_behavior.set_wake_active(active)
 
+    async def request_dormant_home(self, *, reason: str = "tts_ended") -> None:
+        await self.idle_behavior.request_dormant_home(reason=reason)
+
     @property
     def capture_port(self) -> int:
         return int(os.getenv("CAPTURE_PORT", "8766"))
@@ -286,6 +289,7 @@ class Gateway:
                 on_head_command=self.idle_gate.notify_head_command,
                 on_device_state=self.idle_gate.notify_device_state,
                 on_wake_motion=self._on_wake_motion,
+                on_dormant_home=self.request_dormant_home,
                 set_face_tracking=self._set_face_tracking_from_voice,
             )
         if backend == "xiaozhi":
@@ -301,6 +305,7 @@ class Gateway:
             on_head_command=self.idle_gate.notify_head_command,
             on_device_state=self.idle_gate.notify_device_state,
             on_wake_motion=self._on_wake_motion,
+            on_dormant_home=self.request_dormant_home,
             set_face_tracking=self._set_face_tracking_from_voice,
         )
 

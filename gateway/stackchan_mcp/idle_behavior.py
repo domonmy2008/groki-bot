@@ -86,8 +86,14 @@ class IdleBehavior:
         if was_active or not self._dormant_home_sent:
             await self._send_dormant_home()
 
-    async def _send_dormant_home(self) -> None:
+    async def request_dormant_home(self, *, reason: str = "manual") -> None:
+        """Force a protocol-home send even if one was already marked sent."""
+        self._dormant_home_sent = False
+        await self._send_dormant_home(reason=reason)
+
+    async def _send_dormant_home(self, *, reason: str = "wake_inactive") -> None:
         if not self._device_reachable():
+            logger.info("dormant home deferred (%s): device unreachable", reason)
             self._dormant_home_sent = False
             return
         args = {
@@ -98,9 +104,17 @@ class IdleBehavior:
         try:
             await self._send_head_angles(args)
         except Exception:
-            logger.exception("dormant home head command failed")
+            logger.exception("dormant home head command failed (%s)", reason)
             self._dormant_home_sent = False
             return
+        logger.info(
+            "dormant home sent (%s): yaw=%s pitch=%s speed=%s voice_only=%s",
+            reason,
+            args["yaw"],
+            args["pitch"],
+            args["speed"],
+            self._esp32_voice_only(),
+        )
         self._dormant_home_sent = True
         self._last_yaw = float(self.HOME_YAW)
         self._last_pitch = float(self.HOME_PITCH)
@@ -339,7 +353,8 @@ class IdleBehavior:
             error = result[1] if isinstance(result, tuple) and len(result) == 2 else None
             if error:
                 message = error.get("message", error) if isinstance(error, dict) else error
-                logger.debug("idle WS head send failed: %s", message)
+                logger.warning("idle WS head send failed: %s", message)
+                raise RuntimeError(f"idle WS head send failed: {message}")
             return
         try:
             await self.esp32.call_tool(

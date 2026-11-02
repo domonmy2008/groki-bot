@@ -398,6 +398,77 @@ async def test_listening_session_dead_still_closes_and_lights_red(monkeypatch):
 
 
 @pytest.mark.asyncio
+
+async def test_reconnect_reuses_wake_gate_without_rebuild(monkeypatch):
+    """Supervisor soft-stop must not recreate KWS / wipe DORMANT spotting."""
+    from stackchan_mcp.gemini_voice_proxy import GeminiVoiceProxy
+    from stackchan_mcp.wake_gate import WakeGate, WakeGateState
+
+    creates = {"n": 0}
+
+    class FakeKws:
+        available = True
+
+        def detect(self, pcm):
+            return False
+
+        def reset(self):
+            pass
+
+    def factory():
+        creates["n"] += 1
+        return WakeGate(kws=FakeKws(), idle_s=30.0, activity_rms_threshold=0.0)
+
+    class FakeBridge:
+        def __init__(self, **kwargs):
+            self.metrics = {}
+
+        async def start(self):
+            return None
+
+        async def wait_connected(self, timeout=10.0):
+            return True
+
+        async def stop(self):
+            return None
+
+        async def check_connection(self, timeout=10.0):
+            return True
+
+    proxy = GbotVoiceProxy(
+        wake_gate_factory=factory,
+        bridge_factory=lambda **kwargs: FakeBridge(**kwargs),
+        device_tts_start_delay_s=0,
+        device_frame_pace_ms=0,
+        device_prebuffer_ms=0,
+        debug_status=DebugStatus(),
+    )
+    monkeypatch.setenv("STACKCHAN_WAKE_WORD", "1")
+    # First connect creates the gate once.
+    assert await GeminiVoiceProxy.start(
+        proxy, SimpleNamespace(device_id="fixture-device"), {}, lambda *_a, **_k: None
+    )
+    assert creates["n"] == 1
+    gate1 = proxy._wake_gate
+    assert gate1 is not None
+    assert gate1.state == WakeGateState.DORMANT
+
+    # Soft-stop as supervisor does on reconnect.
+    await GeminiVoiceProxy.stop(proxy, preserve_wake_gate=True)
+    assert proxy._wake_gate is gate1
+
+    # Second connect must reuse the same gate (no second factory call).
+    assert await GeminiVoiceProxy.start(
+        proxy, SimpleNamespace(device_id="fixture-device"), {}, lambda *_a, **_k: None
+    )
+    assert creates["n"] == 1
+    assert proxy._wake_gate is gate1
+
+    await GeminiVoiceProxy.stop(proxy)  # full teardown
+    assert proxy._wake_gate is None
+
+
+@pytest.mark.asyncio
 async def test_prepare_for_wake_waits_for_supervisor_reconnect(monkeypatch):
     proxy = GbotVoiceProxy(
         wake_gate_factory=lambda: None,

@@ -295,8 +295,13 @@ class WakeGate:
 
         If goodbye TTS is still playing, defer the KWS reset until the mic is
         free so half-duplex echo cannot pollute a freshly reset stream.
+
+        Already-DORMANT calls are a no-op: a second end_the_call (idle hangup
+        after 退下) must not reset KWS mid-"Hi Grok".
         """
         was_listening = self.is_listening
+        if not was_listening and self.state == WakeGateState.DORMANT:
+            return False
         self.state = WakeGateState.DORMANT
         self._last_voice_at = None
         self._opened_at = None

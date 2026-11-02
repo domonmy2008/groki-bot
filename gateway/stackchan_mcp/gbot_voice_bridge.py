@@ -182,6 +182,7 @@ class GbotVoiceBridge:
         self._on_transcript = on_transcript
         self._on_text = on_text
         self._on_end_conversation = on_end_conversation
+        self._end_conversation_done = False
         self._executor = tool_executor
         self._executor_factory = tool_executor_factory
         self._executor_options = dict(
@@ -469,7 +470,9 @@ class GbotVoiceBridge:
                     not self._stopped
                     and not self._response_in_progress
                     and not self._user_speaking
+                    and not self._end_conversation_done
                 ):
+                    self._end_conversation_done = True
                     await self._on_end_conversation()
 
             self._idle_task = asyncio.create_task(idle())
@@ -914,6 +917,7 @@ class GbotVoiceBridge:
             self.metrics["speech_starts"] += 1
             self._user_epoch += 1
             self._user_speaking = True
+            self._end_conversation_done = False
             self._cancel_idle()
             logger.info(
                 "Grok voice uplink VAD state=started user_epoch=%d response_in_progress=%s",
@@ -1118,7 +1122,8 @@ class GbotVoiceBridge:
                     outcome = "native_" + result["relay"]
             elif name == "end_the_call":
                 result = {"ok": True}
-                if self._on_end_conversation:
+                if self._on_end_conversation and not self._end_conversation_done:
+                    self._end_conversation_done = True
                     await self._on_end_conversation()
             elif original and self._executor:
                 result = await self._executor.execute(original, arguments)

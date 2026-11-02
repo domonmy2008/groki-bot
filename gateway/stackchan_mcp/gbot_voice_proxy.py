@@ -92,12 +92,16 @@ class GbotVoiceProxy(GeminiVoiceProxy):
             logger.warning("Grok voice connection failed (details redacted)")
             connected = False
         if not connected:
+            metrics = getattr(self._bridge, "metrics", None) or {}
+            stage = metrics.get("startup_stage")
             self._health["last_error"] = (
-                getattr(self._bridge, "metrics", {}).get("connection_error")
+                metrics.get("connection_error")
+                or (f"startup_failed:{stage}" if stage else None)
                 or "connection_failed"
             )
             await self._abort_in_flight_tts()
-            await super().stop()
+            # Keep KWS across failed connect attempts; supervisor will retry.
+            await super().stop(preserve_wake_gate=True)
             self._stopped = False
         return connected
 
@@ -135,7 +139,9 @@ class GbotVoiceProxy(GeminiVoiceProxy):
                     continue
             self._record_connection(False, self._health["last_error"] or "connection_lost")
             await self._abort_in_flight_tts()
-            await super().stop()
+            # Soft-stop: drop the voice socket but keep the wake gate so a
+            # reconnect does not recreate sherpa-onnx / wipe DORMANT spotting.
+            await super().stop(preserve_wake_gate=True)
             # The supervisor owns recovery; explicit stop cancels this task.
             self._stopped = False
             await self._sleep_until_nudge(

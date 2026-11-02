@@ -131,6 +131,7 @@ class GeminiVoiceProxy:
     # gateway homes the head. LED and TTS ownership stay in the blocks below;
     # this hook only reports the gate transition.
     on_wake_motion: Callable[[bool], Awaitable[None] | None] | None = None
+    on_dormant_home: Callable[..., Awaitable[None] | None] | None = None
     set_face_tracking: Callable[[bool], Awaitable[dict[str, Any]]] | None = None
     debug_status: DebugStatus | None = None
 
@@ -376,12 +377,21 @@ class GeminiVoiceProxy:
         )
         if tts_mode == "edge":
             logger.info("Gemini TTS mode: edge (text-only Live + edge-tts)")
-        self._wake_gate = (
-            self.wake_gate_factory()
-            if self.wake_gate_factory is not None
-            else create_wake_gate_from_env()
-        )
-        self._wake_gate_passthrough = self._wake_gate is None
+        # Reuse an existing wake gate across voice reconnects. Creating a new
+        # sherpa-onnx KeywordSpotter on every supervisor retry was logging many
+        # "KWS ready" lines and wiping mid-phrase spotting while DORMANT.
+        if self._wake_gate is None and not self._wake_gate_passthrough:
+            self._wake_gate = (
+                self.wake_gate_factory()
+                if self.wake_gate_factory is not None
+                else create_wake_gate_from_env()
+            )
+            self._wake_gate_passthrough = self._wake_gate is None
+        elif self._wake_gate is not None:
+            logger.info(
+                "reusing wake gate across reconnect (state=%s)",
+                self._wake_gate.state.value,
+            )
         gate = self._wake_gate
         if gate is not None:
             gate.is_tts_active = lambda: self._tts_active
@@ -439,6 +449,50 @@ class GeminiVoiceProxy:
             gate is not None and not self._wake_gate_passthrough and gate.is_listening
         )
         await self._set_wake_motion(listening)
+
+
+
+    async def _backup_dormant_home_after_goodbye(self) -> None:
+        """Wait out goodbye TTS, then force home once more."""
+        try:
+            for _ in range(150):  # up to ~30s
+                if not self._tts_active:
+                    break
+                await asyncio.sleep(0.2)
+            await asyncio.sleep(0.25)
+            await self._request_dormant_home_after_tts()
+        except Exception:
+            logger.exception("backup dormant home after goodbye failed")
+
+    async def _request_dormant_home_after_tts(self) -> None:
+        """Re-send protocol home after goodbye TTS frees the servo.
+
+        Firmware holds the head still while Speaking (shared power rail) and
+        only then applies a deferred ``head`` command. Wait briefly after
+        ``tts.stop`` so the device leaves Speaking before we force home.
+        No-op while LISTENING.
+        """
+        gate = self._wake_gate
+        if gate is not None and gate.is_listening:
+            return
+        await asyncio.sleep(0.2)
+        gate = self._wake_gate
+        if gate is not None and gate.is_listening:
+            return
+        callback = self.on_dormant_home
+        if callback is None:
+            await self._set_wake_motion(False)
+            return
+        try:
+            result = callback(reason="tts_ended")
+            if inspect.isawaitable(result):
+                await result
+        except TypeError:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("dormant home after TTS failed")
 
     async def _set_wake_motion(self, active: bool) -> None:
         callback = self.on_wake_motion
@@ -508,7 +562,13 @@ class GeminiVoiceProxy:
             return
         await sender(pcm)
 
-    async def stop(self) -> None:
+    async def stop(self, *, preserve_wake_gate: bool = False) -> None:
+        """Tear down the voice session.
+
+        ``preserve_wake_gate=True`` keeps the KeywordSpotter / gate state for
+        supervisor reconnects so DORMANT spotting is not rebuilt every attempt.
+        Full shutdown (device gone, explicit stop) leaves the default False.
+        """
         self._stopped = True
         self._tts_generation += 1
         if self._keepalive is not None:
@@ -525,8 +585,9 @@ class GeminiVoiceProxy:
         self._bridge = None
         self._codec = None
         self._edge_tts = None
-        self._wake_gate = None
-        self._wake_gate_passthrough = False
+        if not preserve_wake_gate:
+            self._wake_gate = None
+            self._wake_gate_passthrough = False
         self._ready_event.clear()
 
     async def ensure_connected(self) -> bool:
@@ -759,13 +820,13 @@ class GeminiVoiceProxy:
         """Close the wake window when the model explicitly ends the conversation.
 
         Leave in-flight goodbye TTS alone so it finishes via normal end_tts /
-        tts.stop. Post-hangup "(Line dropped.)" is avoided by skipping
-        response.create after end_the_call at the bridge tool layer. The wake
-        gate defers KWS reset while TTS is still active so half-duplex echo
-        does not pollute spotting for the next Hi Grok.
+        tts.stop. Always stop wake motion / send home even if the gate was
+        already DORMANT (close() false), and schedule a backup home after TTS
+        in case the first send was deferred while Speaking.
         """
         gate = self._wake_gate
         if gate is None:
+            await self._set_wake_motion(False)
             return
         closed = gate.close()
         if closed:
@@ -778,7 +839,13 @@ class GeminiVoiceProxy:
             if not self._tts_active:
                 await self._set_leds_safe(0, 0, 0)
                 await self._send_device_emotion_safe(IDLE_EMOTION)
-            await self._set_wake_motion(False)
+        # Home even when close() was a no-op (already DORMANT).
+        await self._set_wake_motion(False)
+        if self._tts_active:
+            asyncio.create_task(
+                self._backup_dormant_home_after_goodbye(),
+                name="dormant-home-after-goodbye",
+            )
 
     async def try_handle_device_mcp(self, message: dict[str, Any]) -> bool:
         """Device MCP responses go back to the gateway, not to us.
@@ -1547,6 +1614,7 @@ class GeminiVoiceProxy:
             self._signal_speaking_avatar("idle")
             self._signal_speaking_leds(*self._post_tts_led_rgb())
             self._clear_turn_emotion_face()
+            await self._request_dormant_home_after_tts()
 
     async def _abort_in_flight_tts(self) -> None:
         """Drop in-flight TTS and tell the device to leave Speaking state.
