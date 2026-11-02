@@ -29,6 +29,7 @@ from stackchan_mcp.wake_gate import (
     WakeGate,
     WakeGateResult,
     WakeGateState,
+    create_wake_gate_from_env,
 )
 
 
@@ -891,6 +892,39 @@ async def test_bridge_end_conversation_closes_wake_gate_and_extinguishes_led(
     assert gate.state == WakeGateState.DORMANT
     led_calls = [c for c in esp32.calls if c[0] == "self.led.set_all"]
     assert led_calls[-1][1] == {"r": 0, "g": 0, "b": 0}
+
+
+@pytest.mark.asyncio
+async def test_disabled_wake_gate_is_cached_for_the_session(monkeypatch, info, caplog):
+    monkeypatch.setenv("STACKCHAN_WAKE_WORD", "0")
+    proxy, _, _sent = _make_proxy(monkeypatch=monkeypatch)
+    calls = 0
+
+    def factory():
+        nonlocal calls
+        calls += 1
+        return create_wake_gate_from_env()
+
+    proxy.wake_gate_factory = factory
+
+    async def send(_msg):
+        return None
+
+    with caplog.at_level(logging.INFO, logger="stackchan_mcp.wake_gate"):
+        await proxy.start(info, {"type": "hello"}, send)
+        for _ in range(8):
+            assert await proxy.send_device_binary(b"frame") is True
+        assert calls == 1
+        assert proxy._wake_gate is None
+        assert proxy._wake_gate_passthrough is True
+        assert proxy._bridge.audio_sent == [b"PCM" * 4] * 8
+        assert caplog.text.count("wake word gate disabled") == 1
+
+        await proxy.stop()
+        await proxy.start(info, {"type": "hello"}, send)
+        assert await proxy.send_device_binary(b"frame") is True
+        assert calls == 2
+        assert caplog.text.count("wake word gate disabled") == 2
 
 
 @pytest.mark.asyncio

@@ -179,7 +179,6 @@ class GbotVoiceBridge:
         self._on_interrupt = on_interrupt
         self._on_session_dead = on_session_dead
         self._connected_event = asyncio.Event()
-        self._health_ack = asyncio.Event()
         self._health_lock = asyncio.Lock()
         self.response_stall_timeout_s = 30.0
         self._response_progress_at = None
@@ -700,9 +699,29 @@ class GbotVoiceBridge:
         return self.running
 
     async def check_connection(self, timeout=10.0):
-        """Require a new acknowledgement on the actual voice WebSocket."""
+        """Return whether this voice socket can still carry audio.
+
+        Liveness is local: the WebSocket is open, it has no protocol error,
+        and the receive task is still running. ``timeout`` stays in the
+        signature for callers. The check does not wait on the peer and does
+        not send ``session.update``.
+
+        The first full ``session.update`` is still required at startup, and
+        ``session.updated`` still marks the session connected. A later probe
+        with an empty session is not. Live Grok voice acknowledges that first
+        update, then leaves an empty follow-up unanswered. The old probe
+        waited out ``timeout`` (10 s), so with the 30 s health interval the
+        supervisor recorded ``voice_check_failed`` about every 40 s,
+        reconnected, and server VAD never finished a spoken reply.
+        ``ClientWebSocketResponse.ping()`` only sends a frame; it does not
+        wait for a pong. The heartbeat passed to ``ws_connect`` already does,
+        and a missed pong closes the socket.
+        """
+        del timeout
         async with self._health_lock:
             if self._stopped or not self.running or not self._connected_event.is_set():
+                return False
+            if not self._transport_alive():
                 return False
             if (
                 self._response_progress_at is not None
@@ -712,17 +731,22 @@ class GbotVoiceBridge:
             ):
                 self.metrics["connection_error"] = "response_stalled"
                 return False
-            self._health_ack.clear()
+            return True
 
-            async def probe():
-                await self._send({"type": "session.update", "session": {}})
-                await self._health_ack.wait()
-
-            try:
-                await asyncio.wait_for(probe(), timeout)
-            except Exception:
-                return False
-            return self.running and not self._stopped
+    def _transport_alive(self):
+        ws = self._ws
+        task = self._task
+        if ws is None or task is None or task.done():
+            return False
+        if getattr(ws, "closed", True):
+            return False
+        error = getattr(ws, "exception", None)
+        if not callable(error):
+            return True
+        try:
+            return error() is None
+        except Exception:
+            return False
 
     async def _send(self, event):
         if self._ws is None or self._ws.closed:
@@ -789,7 +813,6 @@ class GbotVoiceBridge:
         kind = event.get("type")
         if kind == "session.updated":
             self._connected_event.set()
-            self._health_ack.set()
         elif kind == "response.created":
             self._response_progress_at = time.monotonic()
             self._active_response = event.get("response", {}).get("id")

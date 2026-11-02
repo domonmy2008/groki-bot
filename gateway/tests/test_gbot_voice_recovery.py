@@ -148,20 +148,62 @@ async def test_initial_voice_failure_recovers_without_reconnecting_device(monkey
 
 
 @pytest.mark.asyncio
-async def test_open_but_unresponsive_voice_socket_is_replaced(monkeypatch):
+async def test_open_socket_stays_up_without_empty_session_probe(monkeypatch):
     upstream = Upstream()
     async with connected_proxy(monkeypatch, upstream) as (proxy, delivered, sink):
         assert await proxy.start(SimpleNamespace(device_id="fixture-device"), {}, sink)
-        upstream.acknowledge = False
-        await eventually(lambda: not proxy.connected)
-        assert proxy._status.snapshot()["voice"]["state"] == "reconnecting"
-        await eventually(lambda: upstream.sockets[0].closed)
-        upstream.acknowledge = True
-        await eventually(lambda: proxy.connected)
-        assert len(upstream.sockets) >= 2
-        result = await proxy.speak_text("new reply", session_id="fixture", prompt_audio_frames=[])
+        await eventually(lambda: proxy.health_snapshot()["successful_checks"] >= 2)
+        assert proxy.connected
+        assert len(upstream.sockets) == 1
+        assert upstream.sockets[0].closed is False
+        assert upstream.updates
+        assert all(update["session"] != {} for update in upstream.updates)
+        result = await proxy.speak_text("still here", session_id="fixture", prompt_audio_frames=[])
         assert result["ok"] and any(isinstance(frame, bytes) for frame in delivered)
-        assert any(update["session"] == {} for update in upstream.updates)
+
+
+@pytest.mark.asyncio
+async def test_check_connection_fails_when_socket_or_receive_task_is_dead(monkeypatch):
+    upstream = Upstream()
+    async with connected_proxy(monkeypatch, upstream) as (proxy, _delivered, sink):
+        assert await proxy.start(SimpleNamespace(device_id="fixture-device"), {}, sink)
+        bridge = proxy._bridge
+        before = len(upstream.updates)
+        assert await bridge.check_connection(0.05) is True
+        assert len(upstream.updates) == before
+
+        health = proxy._health_task
+        proxy._health_task = None
+        health.cancel()
+        await asyncio.gather(health, return_exceptions=True)
+
+        original_ws = bridge._ws
+        original_task = bridge._task
+        try:
+            bridge._ws = SimpleNamespace(closed=True, exception=lambda: None)
+            assert await bridge.check_connection(0.05) is False
+
+            finished = asyncio.create_task(asyncio.sleep(0))
+            await finished
+            bridge._ws = SimpleNamespace(closed=False, exception=lambda: None)
+            bridge._task = finished
+            bridge.running = True
+            bridge._stopped = False
+            bridge._connected_event.set()
+            assert await bridge.check_connection(0.05) is False
+
+            bridge._ws = SimpleNamespace(
+                closed=False, exception=lambda: RuntimeError("pong timeout")
+            )
+            bridge._task = original_task
+            assert await bridge.check_connection(0.05) is False
+            assert all(update["session"] != {} for update in upstream.updates)
+        finally:
+            bridge._ws = original_ws
+            bridge._task = original_task
+            bridge.running = True
+            bridge._stopped = False
+            bridge._connected_event.set()
 
 
 @pytest.mark.asyncio
