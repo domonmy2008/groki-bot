@@ -115,6 +115,9 @@ class GeminiVoiceProxy:
     _wake_gate: WakeGate | None = None
     _wake_gate_failures: int = 0
     _wake_gate_permanently_failed: bool = False
+    # Factory returned None: pass microphone through for this session.
+    # None is not a missing gate, so it must not be rebuilt on every frame.
+    _wake_gate_passthrough: bool = False
     _wake_gate_next_rebuild_at: float = 0.0
     _wake_gate_rebuild_max: int = 3
     _keepalive: SessionKeepalive | None = None
@@ -347,6 +350,7 @@ class GeminiVoiceProxy:
             if self.wake_gate_factory is not None
             else create_wake_gate_from_env()
         )
+        self._wake_gate_passthrough = self._wake_gate is None
         gate = self._wake_gate
         if gate is not None:
             gate.is_tts_active = lambda: self._tts_active
@@ -467,6 +471,7 @@ class GeminiVoiceProxy:
         self._codec = None
         self._edge_tts = None
         self._wake_gate = None
+        self._wake_gate_passthrough = False
         self._ready_event.clear()
 
     async def ensure_connected(self) -> bool:
@@ -539,6 +544,8 @@ class GeminiVoiceProxy:
             return None
         if self._wake_gate is not None:
             return self._wake_gate
+        if self._wake_gate_passthrough:
+            return None
         now = time.monotonic()
         if now < self._wake_gate_next_rebuild_at:
             return None
@@ -556,6 +563,7 @@ class GeminiVoiceProxy:
             self._wake_gate_next_rebuild_at = now + delay
             return None
         self._wake_gate_failures = 0
+        self._wake_gate_passthrough = gate is None
         self._configure_wake_gate(gate)
         self._status.on_wake_gate_configured(
             available=bool(gate is not None and gate.available),
@@ -566,6 +574,7 @@ class GeminiVoiceProxy:
     def _handle_wake_gate_process_error(self, exc: Exception) -> None:
         logger.warning("wake word gate failed; scheduling rebuild: %s", exc)
         self._wake_gate = None
+        self._wake_gate_passthrough = False
         self._wake_gate_failures += 1
         if self._wake_gate_failures >= self._wake_gate_rebuild_max:
             self._wake_gate_permanently_failed = True
