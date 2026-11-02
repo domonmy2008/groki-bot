@@ -869,6 +869,53 @@ async def test_wake_gate_idle_close_uses_direct_led_when_ws_has_no_mcp(
 
 
 @pytest.mark.asyncio
+async def test_wake_open_and_close_toggle_head_motion(monkeypatch, info):
+    """LISTENING enables wake motion; DORMANT and 退下 home it. LEDs stay owned elsewhere."""
+    motions: list[bool] = []
+
+    async def on_wake_motion(active: bool) -> None:
+        motions.append(active)
+
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    proxy, esp32, sent = _make_proxy(monkeypatch=monkeypatch)
+    proxy.on_wake_motion = on_wake_motion
+    gate = WakeGate(
+        kws=ScriptedKeywordSpotter([True, False, True]),
+        idle_s=1.0,
+        activity_rms_threshold=1000.0,
+        clock=clock,
+    )
+    proxy.wake_gate_factory = lambda: gate
+
+    async def send(msg):
+        sent.append(msg)
+
+    await proxy.start(info, {"type": "hello"}, send)
+    assert motions == [False]
+
+    await proxy.send_device_binary(b"wake")
+    assert motions == [False, True]
+    assert gate.state == WakeGateState.LISTENING
+
+    now = 1.1
+    assert await proxy.send_device_binary(b"noise") is True
+    assert gate.state == WakeGateState.DORMANT
+    assert motions == [False, True, False]
+    led_calls = [c for c in esp32.calls if c[0] == "self.led.set_all"]
+    assert led_calls[-1][1] == {"r": 0, "g": 0, "b": 0}
+
+    await proxy.send_device_binary(b"wake")
+    assert motions[-1] is True
+    await proxy._handle_bridge_end_conversation()
+    assert gate.state == WakeGateState.DORMANT
+    assert motions[-1] is False
+
+
+@pytest.mark.asyncio
 async def test_bridge_end_conversation_closes_wake_gate_and_extinguishes_led(
     monkeypatch,
     info,

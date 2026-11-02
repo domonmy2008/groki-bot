@@ -136,11 +136,13 @@ class Gateway:
             usb_transport=self.usb_transport,
             on_face_detected=self._notify_face_detected,
             on_auto_head_command=self.idle_gate.notify_auto_head_command,
-            # The head holds still while the robot speaks or listens.
+            # Speaking still holds the head (servo rail shared with the amp).
+            # Face chase itself is allowed only inside an open wake window.
             is_tts_active=lambda: get_debug_status().tts_active,
             is_listening=lambda: bool(getattr(
                 getattr(self._active_voice_proxy(), "_wake_gate", None), "is_listening", False,
             )),
+            wake_motion_allowed=self._wake_head_motion_allowed,
         )
         # The face tracker runs as long as the gateway does; head follow is on
         # by default and "look at me" / "stop looking" toggle it.
@@ -168,14 +170,34 @@ class Gateway:
             "face_reported": self.face_tracker.available,
             "last_face_at": self._last_face_at,
             "head_follow": self.tracking_bridge.enabled,
-            # idle: following; working: the robot is speaking; quiet: it is
-            # listening after the wake word. The head holds still in both.
+            # idle: no open wake window (head stays home); quiet: LISTENING,
+            # face chase may run; working: speaking, head holds still.
             "mode": self.tracking_bridge.mode,
+            "wake_motion": self._wake_head_motion_allowed(),
         }
 
     def _active_voice_proxy(self):
         connection = getattr(self.esp32, "connection", None)
         return getattr(connection, "cloud_proxy", None)
+
+    def _wake_head_motion_allowed(self) -> bool:
+        """Face chase and idle steps only while a wake gate is LISTENING.
+
+        DORMANT, and passthrough (no gate), keep autonomous motion off so the
+        head stays at the home pose. Intentional ``head`` messages from an
+        active spoken turn are a different path and are not gated here.
+        """
+        proxy = self._active_voice_proxy()
+        if proxy is None or getattr(proxy, "_wake_gate_passthrough", False):
+            return False
+        gate = getattr(proxy, "_wake_gate", None)
+        if gate is None:
+            return False
+        return bool(getattr(gate, "is_listening", False))
+
+    async def _on_wake_motion(self, active: bool) -> None:
+        """Voice-proxy hook: LISTENING may move; DORMANT homes and holds."""
+        await self.idle_behavior.set_wake_active(active)
 
     @property
     def capture_port(self) -> int:
@@ -263,6 +285,7 @@ class Gateway:
                 usb_transport=self.usb_transport,
                 on_head_command=self.idle_gate.notify_head_command,
                 on_device_state=self.idle_gate.notify_device_state,
+                on_wake_motion=self._on_wake_motion,
                 set_face_tracking=self._set_face_tracking_from_voice,
             )
         if backend == "xiaozhi":
@@ -277,6 +300,7 @@ class Gateway:
             usb_transport=self.usb_transport,
             on_head_command=self.idle_gate.notify_head_command,
             on_device_state=self.idle_gate.notify_device_state,
+            on_wake_motion=self._on_wake_motion,
             set_face_tracking=self._set_face_tracking_from_voice,
         )
 

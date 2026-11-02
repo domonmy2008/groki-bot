@@ -127,6 +127,10 @@ class GeminiVoiceProxy:
     wake_gate_factory: Callable[[], WakeGate | None] | None = None
     on_head_command: Callable[[], None] | None = None
     on_device_state: Callable[[str], None] | None = None
+    # LISTENING → True (idle / face chase may run). DORMANT → False, and the
+    # gateway homes the head. LED and TTS ownership stay in the blocks below;
+    # this hook only reports the gate transition.
+    on_wake_motion: Callable[[bool], Awaitable[None] | None] | None = None
     set_face_tracking: Callable[[bool], Awaitable[dict[str, Any]]] | None = None
     debug_status: DebugStatus | None = None
 
@@ -420,8 +424,32 @@ class GeminiVoiceProxy:
         self.server_hello = self._voice_hello()
         self._ready_event.set()
         self._start_keepalive()
+        await self._apply_initial_wake_motion()
         logger.info("Gemini voice backend ready (device=%s)", info.device_id or "?")
         return True
+
+    async def _apply_initial_wake_motion(self) -> None:
+        """Session start is DORMANT (or passthrough): home the head and hold.
+
+        An already-open gate, if one is ever constructed that way, enables
+        wake motion instead. LED / TTS are not touched here.
+        """
+        gate = self._wake_gate
+        listening = bool(
+            gate is not None and not self._wake_gate_passthrough and gate.is_listening
+        )
+        await self._set_wake_motion(listening)
+
+    async def _set_wake_motion(self, active: bool) -> None:
+        callback = self.on_wake_motion
+        if callback is None:
+            return
+        try:
+            result = callback(bool(active))
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("wake motion hook failed")
 
     def _start_keepalive(self) -> None:
         """Optional experimental silent-frame keepalive (off by default; see the session_keepalive module)."""
@@ -669,6 +697,13 @@ class GeminiVoiceProxy:
                 await asyncio.sleep(self.wake_confirm_hold_s)
             await self._send_device_emotion_safe(LISTENING_EMOTION)
             self._signal_wake_chime()
+        # End state wins when one frame both closes and re-wakes. Home on
+        # DORMANT; allow idle / face chase only while LISTENING. LEDs above
+        # are unchanged.
+        if decision.woke:
+            await self._set_wake_motion(True)
+        elif decision.closed:
+            await self._set_wake_motion(False)
         for chunk in decision.forward_pcm:
             await bridge.send_audio(chunk)
 
@@ -681,6 +716,7 @@ class GeminiVoiceProxy:
                 closed = gate.close()
                 if closed:
                     self._status.on_wake_closed()
+                    await self._set_wake_motion(False)
         except Exception:
             logger.exception("session-dead wake gate close failed")
         try:
@@ -706,6 +742,7 @@ class GeminiVoiceProxy:
             if not self._tts_active:
                 await self._set_leds_safe(0, 0, 0)
                 await self._send_device_emotion_safe(IDLE_EMOTION)
+            await self._set_wake_motion(False)
 
     async def try_handle_device_mcp(self, message: dict[str, Any]) -> bool:
         """Device MCP responses go back to the gateway, not to us.

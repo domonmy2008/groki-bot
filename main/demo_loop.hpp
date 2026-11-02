@@ -11,10 +11,11 @@
 #include "shared_state.hpp"
 
 // The main-task foreground loop: input dispatch (M5 buttons / LCD touch /
-// IMU tilt+dizzy / Si12T nadenade) + idle avatar behaviours (random poses, jtts)
-// babble balloons, expression cycling) + housekeeping watchers (speaker
-// volume/mute, LT timer, battery polling). Runs forever on the app_main
-// task; every other subsystem lives in its own task.
+// IMU tilt+dizzy / Si12T nadenade) + idle avatar behaviours (resting head
+// pose, jtts babble balloons, expression cycling) + housekeeping watchers
+// (speaker volume/mute, LT timer, battery polling). Runs forever on the
+// app_main task; every other subsystem lives in its own task. Wake-time
+// look-around is owned by the gateway via WS head messages.
 namespace stackchan::app {
 
 struct DemoLoopArgs {

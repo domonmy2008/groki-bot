@@ -88,6 +88,42 @@ async def test_tracking_ignores_low_confidence_and_working_mode():
 
 
 @pytest.mark.asyncio
+async def test_wake_policy_chases_only_while_listening():
+    """Gateway policy: LISTENING may chase; DORMANT and a failing policy hold still."""
+    esp32 = FakeESP32()
+    allowed = {"on": False}
+
+    def policy() -> bool:
+        if allowed["on"] == "boom":
+            raise RuntimeError("policy down")
+        return bool(allowed["on"])
+
+    bridge = TrackingBridge(
+        esp32,
+        config=TrackingConfig(smoothing=1.0, move_threshold=0.0),
+        is_listening=lambda: bool(allowed["on"]) if allowed["on"] != "boom" else False,
+        wake_motion_allowed=policy,
+    )
+    detection = {"x": 0.8, "y": 0.5, "confidence": 0.9}
+    try:
+        assert await bridge.handle_detection(detection) is False
+        allowed["on"] = True
+        assert bridge.mode == "quiet"
+        assert await bridge.handle_detection(detection) is True
+        await pump_resampler(bridge)
+        assert len(esp32.calls) == 1
+        allowed["on"] = False
+        esp32.calls.clear()
+        assert await bridge.handle_detection(detection) is False
+        await pump_resampler(bridge)
+        assert esp32.calls == []
+        allowed["on"] = "boom"
+        assert await bridge.handle_detection(detection) is False
+    finally:
+        await bridge.stop()
+
+
+@pytest.mark.asyncio
 async def test_live_voice_states_pause_tracking_and_resume_head_writes():
     esp32 = FakeESP32()
     voice = {"tts": False, "listening": False}
