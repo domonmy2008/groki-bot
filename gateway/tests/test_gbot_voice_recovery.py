@@ -305,3 +305,195 @@ async def test_silent_reply_recovers_without_replaying_user_request(monkeypatch)
         finally:
             speaking.cancel()
             await asyncio.gather(speaking, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_dormant_session_dead_does_not_sticky_red(monkeypatch):
+    """Silent WS death while DORMANT must not paint sticky red / reported_dead."""
+    from stackchan_mcp.device_emotion import DEAD_LED_RGB
+    from stackchan_mcp.wake_gate import WakeGate, WakeGateState
+
+    class FakeSpotter:
+        available = True
+
+        def detect(self, pcm):
+            return False
+
+        def reset(self):
+            return None
+
+    class LedESP32:
+        device_connected = True
+
+        def __init__(self):
+            self.leds = []
+
+        async def send_led(self, r, g, b, *, notify_activity=True):
+            self.leds.append((r, g, b))
+            return {"ok": True}, None
+
+    esp32 = LedESP32()
+    gate = WakeGate(kws=FakeSpotter(), activity_rms_threshold=0.0)
+    assert gate.state == WakeGateState.DORMANT
+    proxy = GbotVoiceProxy(
+        wake_gate_factory=lambda: gate,
+        esp32_ref=lambda: esp32,
+        device_tts_start_delay_s=0,
+        device_frame_pace_ms=0,
+        device_prebuffer_ms=0,
+        debug_status=DebugStatus(),
+    )
+    proxy._wake_gate = gate
+    proxy._stopped = False
+
+    await proxy._handle_session_dead()
+    assert gate.state == WakeGateState.DORMANT
+    assert proxy._reported_dead is False
+    assert DEAD_LED_RGB not in esp32.leds
+
+
+@pytest.mark.asyncio
+async def test_listening_session_dead_still_closes_and_lights_red(monkeypatch):
+    from stackchan_mcp.device_emotion import DEAD_LED_RGB
+    from stackchan_mcp.wake_gate import WakeGate, WakeGateState
+
+    class FakeSpotter:
+        available = True
+
+        def detect(self, pcm):
+            return True
+
+        def reset(self):
+            return None
+
+    class LedESP32:
+        device_connected = True
+
+        def __init__(self):
+            self.leds = []
+
+        async def send_led(self, r, g, b, *, notify_activity=True):
+            self.leds.append((r, g, b))
+            return {"ok": True}, None
+
+    esp32 = LedESP32()
+    gate = WakeGate(kws=FakeSpotter(), activity_rms_threshold=0.0)
+    gate.process(b"\x00\x00" * 160)
+    assert gate.state == WakeGateState.LISTENING
+    proxy = GbotVoiceProxy(
+        wake_gate_factory=lambda: gate,
+        esp32_ref=lambda: esp32,
+        device_tts_start_delay_s=0,
+        device_frame_pace_ms=0,
+        device_prebuffer_ms=0,
+        debug_status=DebugStatus(),
+    )
+    proxy._wake_gate = gate
+    proxy._stopped = False
+
+    await proxy._handle_session_dead()
+    assert gate.state == WakeGateState.DORMANT
+    assert proxy._reported_dead is True
+    assert esp32.leds[-1] == DEAD_LED_RGB
+
+
+@pytest.mark.asyncio
+async def test_prepare_for_wake_waits_for_supervisor_reconnect(monkeypatch):
+    proxy = GbotVoiceProxy(
+        wake_gate_factory=lambda: None,
+        device_tts_start_delay_s=0,
+        device_frame_pace_ms=0,
+        device_prebuffer_ms=0,
+        debug_status=DebugStatus(),
+    )
+    proxy.wake_reconnect_timeout_s = 0.5
+    proxy._stopped = False
+    proxy._health["state"] = "reconnecting"
+    proxy._health["last_error"] = "connection_lost"
+
+    connected = {"value": False}
+
+    def fake_connected(self):
+        return connected["value"]
+
+    monkeypatch.setattr(GbotVoiceProxy, "connected", property(fake_connected))
+
+    async def flip():
+        await asyncio.sleep(0.05)
+        connected["value"] = True
+
+    task = asyncio.create_task(flip())
+    try:
+        assert await proxy._prepare_for_wake() is True
+    finally:
+        await task
+
+
+@pytest.mark.asyncio
+async def test_prepare_for_wake_aborts_when_still_disconnected(monkeypatch):
+    proxy = GbotVoiceProxy(
+        wake_gate_factory=lambda: None,
+        device_tts_start_delay_s=0,
+        device_frame_pace_ms=0,
+        device_prebuffer_ms=0,
+        debug_status=DebugStatus(),
+    )
+    proxy.wake_reconnect_timeout_s = 0.15
+    proxy._stopped = False
+    monkeypatch.setattr(GbotVoiceProxy, "connected", property(lambda self: False))
+    assert await proxy._prepare_for_wake() is False
+
+
+@pytest.mark.asyncio
+async def test_wake_open_aborts_when_prepare_for_wake_fails(monkeypatch):
+    """KWS OPEN with unhealthy voice closes the gate instead of listening into a void."""
+    from stackchan_mcp.wake_gate import WakeGate, WakeGateState
+
+    class OnceSpotter:
+        available = True
+
+        def __init__(self):
+            self._hit = False
+
+        def detect(self, pcm):
+            if self._hit:
+                return False
+            self._hit = True
+            return True
+
+        def reset(self):
+            return None
+
+    class Bridge:
+        running = True
+        sent = []
+
+        async def send_audio(self, pcm):
+            self.sent.append(pcm)
+
+        async def send_activity_start(self):
+            return None
+
+        async def send_activity_end(self):
+            return None
+
+    gate = WakeGate(kws=OnceSpotter(), activity_rms_threshold=999999.0)
+    bridge = Bridge()
+    proxy = GbotVoiceProxy(
+        wake_gate_factory=lambda: gate,
+        device_tts_start_delay_s=0,
+        device_frame_pace_ms=0,
+        device_prebuffer_ms=0,
+        wake_confirm_hold_s=0,
+        debug_status=DebugStatus(),
+    )
+    proxy._wake_gate = gate
+    proxy._bridge = bridge
+    proxy._stopped = False
+    monkeypatch.setattr(
+        GbotVoiceProxy, "_prepare_for_wake", lambda self: asyncio.sleep(0, result=False)
+    )
+
+    await proxy._forward_gated_device_pcm(b"\x00\x00" * 160)
+    assert gate.state == WakeGateState.DORMANT
+    assert bridge.sent == []

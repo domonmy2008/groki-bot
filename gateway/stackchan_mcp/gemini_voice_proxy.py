@@ -658,6 +658,30 @@ class GeminiVoiceProxy:
             except Exception as exc:
                 logger.warning("manual VAD activity_end failed: %s", exc)
 
+    async def _prepare_for_wake(self) -> bool:
+        """Hook before LISTENING UX after KWS OPEN.
+
+        Return False to abort this wake (caller closes the gate and drops
+        preroll). Gemini Live keeps the default True; Grok voice overrides
+        to wait for supervisor reconnect when the socket died in DORMANT.
+        """
+        return True
+
+    async def _abort_wake_open(self, bridge: Any, gate: WakeGate | None) -> None:
+        """Roll back a KWS OPEN that could not get a healthy voice session."""
+        closed = False
+        if gate is not None:
+            try:
+                closed = gate.close()
+            except Exception:
+                logger.exception("wake-open abort gate close failed")
+        if closed:
+            self._status.on_wake_closed()
+        await self._signal_manual_vad_end(bridge)
+        if not self._tts_active:
+            await self._set_leds_safe(0, 0, 0)
+            await self._send_device_emotion_safe(IDLE_EMOTION)
+
     async def _forward_gated_device_pcm(self, pcm: bytes) -> None:
         """Apply the wake gate before forwarding decoded device PCM to Gemini."""
         bridge = self._bridge
@@ -689,6 +713,9 @@ class GeminiVoiceProxy:
                 if inspect.isawaitable(result):
                     await result
         if decision.woke:
+            if not await self._prepare_for_wake():
+                await self._abort_wake_open(bridge, gate)
+                return
             self._reported_dead = False
             await self._signal_manual_vad_start(bridge)
             await self._set_leds_safe(*LISTENING_LED_RGB)

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import logging
 import time
 
+from .device_emotion import DEAD_LED_RGB
 from .gbot_voice_bridge import GbotVoiceBridge
 from .gemini_voice_proxy import GeminiVoiceProxy
 
@@ -22,7 +23,12 @@ class GbotVoiceProxy(GeminiVoiceProxy):
     connect_timeout_s: float = 40.0
     reconnect_initial_delay_s: float = 1.0
     reconnect_max_delay_s: float = 30.0
+    # After end_the_call the wake gate is DORMANT; the voice WS can die quietly.
+    # KWS OPEN must wait for supervisor reconnect instead of feeding a dead socket
+    # (which would _handle_session_dead -> CLOSE + red and feel "unwakeable").
+    wake_reconnect_timeout_s: float = 15.0
     _health_task: asyncio.Task | None = field(default=None, init=False)
+    _reconnect_nudge: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _health: dict = field(default_factory=lambda: {
         "provider": "gbot_voice", "state": "stopped", "reconnect_attempts": 0,
         "successful_checks": 0, "last_verified_at": None, "last_check_at": None,
@@ -44,6 +50,19 @@ class GbotVoiceProxy(GeminiVoiceProxy):
         }
         if connected:
             self._health["last_verified_at"] = time.time()
+            # Successful supervisor reconnect clears sticky dead/red from a prior drop.
+            self._reported_dead = False
+
+    def _nudge_reconnect(self) -> None:
+        """Wake the supervisor sleep so recovery can start immediately."""
+        self._reconnect_nudge.set()
+
+    async def _sleep_until_nudge(self, delay: float) -> None:
+        self._reconnect_nudge.clear()
+        try:
+            await asyncio.wait_for(self._reconnect_nudge.wait(), timeout=max(0.0, delay))
+        except asyncio.TimeoutError:
+            pass
 
     async def start(self, info, device_hello, send_to_device):
         if self._health_task is not None:
@@ -119,7 +138,11 @@ class GbotVoiceProxy(GeminiVoiceProxy):
             await super().stop()
             # The supervisor owns recovery; explicit stop cancels this task.
             self._stopped = False
-            await asyncio.sleep(self.reconnect_max_delay_s if self._health["action_required"] else delay)
+            await self._sleep_until_nudge(
+                self.reconnect_max_delay_s if self._health["action_required"] else delay
+            )
+            if self._stopped:
+                return
             self._health["reconnect_attempts"] += 1
             connected = await self._try_connect(info, device_hello, send_to_device)
             self._record_connection(connected, None if connected else self._health["last_error"])
@@ -127,9 +150,79 @@ class GbotVoiceProxy(GeminiVoiceProxy):
                 checked_at = asyncio.get_running_loop().time()
             delay = min(self.reconnect_max_delay_s, delay * 2)
 
+    async def _prepare_for_wake(self) -> bool:
+        """On KWS OPEN, refuse to listen into a dead Grok voice socket.
+
+        Reuses the existing health supervisor: nudge its backoff sleep, then
+        wait until ``connected`` (or timeout). Returning False makes the
+        shared wake path close the gate instead of lighting cyan into a void.
+        """
+        if self.connected:
+            return True
+        timeout = max(0.0, float(self.wake_reconnect_timeout_s))
+        logger.info(
+            "wake OPEN while Grok voice unhealthy (state=%s error=%s); "
+            "waiting up to %.1fs for supervisor reconnect",
+            self._health.get("state"),
+            self._health.get("last_error"),
+            timeout,
+        )
+        self._nudge_reconnect()
+        if timeout <= 0:
+            return False
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if self._stopped:
+                return False
+            if self.connected:
+                logger.info("wake OPEN: Grok voice reconnected; entering LISTENING")
+                return True
+            self._nudge_reconnect()
+            await asyncio.sleep(0.1)
+        logger.warning(
+            "wake OPEN aborted: Grok voice still disconnected after %.1fs",
+            timeout,
+        )
+        return False
+
+    async def _handle_session_dead(self) -> None:
+        """Voice WS ended. Close an active listen window; let supervisor recover.
+
+        Unlike Gemini Live's audio-cache TTL path, Grok calls this on every
+        unexpected receive exit — including silent death while DORMANT after
+        end_the_call. Sticky red + CLOSE there is what feels like "cannot wake".
+        """
+        was_listening = False
+        try:
+            gate = self._wake_gate
+            if gate is not None:
+                was_listening = gate.close()
+                if was_listening:
+                    self._status.on_wake_closed()
+        except Exception:
+            logger.exception("session-dead wake gate close failed")
+        try:
+            await self._abort_in_flight_tts()
+        except Exception:
+            logger.exception("session-dead abort tts failed")
+        self._nudge_reconnect()
+        if was_listening:
+            self._reported_dead = True
+            try:
+                await self._set_leds_safe(*DEAD_LED_RGB)
+            except Exception:
+                logger.exception("session-dead red LED failed")
+            return
+        # DORMANT silent death: no sticky red; supervisor reconnects quietly.
+        self._reported_dead = False
+        logger.info(
+            "Grok voice session died while DORMANT; supervisor nudged to reconnect"
+        )
+
     async def stop(self):
         task, self._health_task = self._health_task, None
         self._stopped = True
+        self._nudge_reconnect()
         if task is not None and task is not asyncio.current_task():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
