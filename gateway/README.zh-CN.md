@@ -327,6 +327,21 @@ curl -s -X POST http://127.0.0.1:18770/send \
 | `STACKCHAN_GBOT_BIN` | PATH 里的 `gbot` | 转发服务使用的 `gbot` 路径（仅 Gemini CLI 路径） |
 | `STACKCHAN_GBOT_HTTP_PORT` | `18770` | 转发服务端口（始终只绑定 127.0.0.1）（仅 Gemini CLI 路径） |
 
+
+## 延迟相关 `.env` 旋钮（本地）
+
+首包可听延迟（TTFA）主要来自云端 Grok 语音（约 ~3s），不是下面这些本地旋钮。
+当前调优值与含义见 [`.env.latency.example`](.env.latency.example)：
+
+| 变量 | 当前调优 | 含义 |
+|---|---|---|
+| `STACKCHAN_GEMINI_TTS_START_DELAY_SECONDS` | `0.04` | `tts.start` 后稍等再发首帧，避免与 Listening 竞态 |
+| `STACKCHAN_GEMINI_PREBUFFER_MS` | `80` | 起播前预缓冲毫秒数，缓解下行抖动 |
+| `STACKCHAN_WAKE_CONFIRM_HOLD_S` | `0.15` | 唤醒确认表情停留时间（仅 UX） |
+| `STACKCHAN_GBOT_UPLINK_RMS_LOG` | `0` | 上行 RMS 调试日志，常态关闭 |
+
+复制到 `gateway/.env` 后重启网关即可；不要提交真实 `.env`。
+
 ## 安全
 
 - **Mac 控制默认关闭。** 设了 `STACKCHAN_MAC_CONTROL=1` 之后，任何在机器人旁边说话的人都能打开应用和网址、调音量、截屏、运行快捷指令，还能启动可能修改网关目录下文件的 `claude -p` 任务。语音提示词要求破坏性操作先口头确认，但这只是给模型的指令，不是强制的权限检查。

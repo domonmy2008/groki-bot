@@ -3,6 +3,7 @@
 # The gateway is a stdio MCP server and exits when stdin reaches EOF, so this
 # wrapper keeps stdin open with a FIFO that never receives data.
 # Reads .env from the gateway directory. Override the uv binary with UV_BIN.
+# Also restarts gbot_voice_session_bridge.mjs (via restart_gbot_voice_bridge.sh) so a gateway-only restart cannot leave a stale login bridge.
 set -euo pipefail
 
 GATEWAY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,6 +47,16 @@ if [[ -f "${GATEWAY_DIR}/.env" ]]; then
     # shellcheck disable=SC1091
     source "${GATEWAY_DIR}/.env"
     set +a
+fi
+
+# Keep the login voice bridge in sync with this gateway process (desktop assistant
+# otherwise stays disconnected after a gateway-only restart). Missing bridge
+# script only warns; the gateway still starts.
+if [[ -f "${GATEWAY_DIR}/scripts/restart_gbot_voice_bridge.sh" ]]; then
+    bash "${GATEWAY_DIR}/scripts/restart_gbot_voice_bridge.sh" \
+        || echo "warning: gbot voice bridge restart failed; continuing with gateway" >&2
+else
+    echo "warning: restart_gbot_voice_bridge.sh missing; gateway continues without bridge restart" >&2
 fi
 
 

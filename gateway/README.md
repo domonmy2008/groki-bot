@@ -438,6 +438,21 @@ reconnect the MCP client, after a change).
 | `STACKCHAN_GBOT_BIN` | `gbot` on PATH | Forwarding service: path to `gbot` (Gemini CLI path only) |
 | `STACKCHAN_GBOT_HTTP_PORT` | `18770` | Forwarding service port (it always binds 127.0.0.1) (Gemini CLI path only) |
 
+
+## Latency-related `.env` knobs (local)
+
+Dominant time-to-first-audio (~3s) is cloud Grok voice, not these local knobs.
+See [`.env.latency.example`](.env.latency.example) for the current tuned values:
+
+| Variable | Tuned | Meaning |
+|---|---|---|
+| `STACKCHAN_GEMINI_TTS_START_DELAY_SECONDS` | `0.04` | Short guard after `tts.start` before the first Opus frame |
+| `STACKCHAN_GEMINI_PREBUFFER_MS` | `80` | PCM ms to hold before first device playback burst |
+| `STACKCHAN_WAKE_CONFIRM_HOLD_S` | `0.15` | Wake-confirm emotion hold (UX only) |
+| `STACKCHAN_GBOT_UPLINK_RMS_LOG` | `0` | Uplink RMS debug logging; keep off |
+
+Copy into `gateway/.env` and restart the gateway. Do not commit a real `.env`.
+
 ## Safety
 
 - **Mac control is off by default.** With `STACKCHAN_MAC_CONTROL=1`, anyone
