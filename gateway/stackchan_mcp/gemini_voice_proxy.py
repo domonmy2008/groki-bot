@@ -388,6 +388,8 @@ class GeminiVoiceProxy:
             )
             self._wake_gate_passthrough = self._wake_gate is None
         elif self._wake_gate is not None:
+            # Soft reconnect keeps this object and its state. Do not close,
+            # open, or replace it here.
             logger.info(
                 "reusing wake gate across reconnect (state=%s)",
                 self._wake_gate.state.value,
@@ -439,10 +441,12 @@ class GeminiVoiceProxy:
         return True
 
     async def _apply_initial_wake_motion(self) -> None:
-        """Session start is DORMANT (or passthrough): home the head and hold.
+        """Match head motion to the wake gate without changing its state.
 
-        An already-open gate, if one is ever constructed that way, enables
-        wake motion instead. LED / TTS are not touched here.
+        First connect is DORMANT, so the head homes and holds. A soft
+        reconnect keeps whatever state the gate already has: DORMANT still
+        homes, LISTENING still allows motion. This does not OPEN or CLOSE.
+        LED / TTS are not touched here.
         """
         gate = self._wake_gate
         listening = bool(

@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 import logging
 import time
 
-from .device_emotion import DEAD_LED_RGB
 from .gbot_voice_bridge import GbotVoiceBridge
 from .gemini_voice_proxy import GeminiVoiceProxy
 
@@ -24,8 +23,9 @@ class GbotVoiceProxy(GeminiVoiceProxy):
     reconnect_initial_delay_s: float = 1.0
     reconnect_max_delay_s: float = 30.0
     # After end_the_call the wake gate is DORMANT; the voice WS can die quietly.
-    # KWS OPEN must wait for supervisor reconnect instead of feeding a dead socket
-    # (which would _handle_session_dead -> CLOSE + red and feel "unwakeable").
+    # KWS OPEN must wait for supervisor reconnect instead of feeding a dead socket.
+    # A failed wait rolls the new OPEN back via _abort_wake_open. A socket drop
+    # while already DORMANT or LISTENING must not itself change gate.state.
     wake_reconnect_timeout_s: float = 15.0
     _health_task: asyncio.Task | None = field(default=None, init=False)
     _reconnect_nudge: asyncio.Event = field(default_factory=asyncio.Event, init=False)
@@ -214,37 +214,28 @@ class GbotVoiceProxy(GeminiVoiceProxy):
         )
 
     async def _handle_session_dead(self) -> None:
-        """Voice WS ended. Close an active listen window; let supervisor recover.
+        """Voice WS ended. Keep the wake-gate state and let the supervisor reconnect.
 
-        Unlike Gemini Live's audio-cache TTL path, Grok calls this on every
-        unexpected receive exit — including silent death while DORMANT after
-        end_the_call. Sticky red + CLOSE there is what feels like "cannot wake".
+        Grok calls this on every unexpected receive exit, including a quiet
+        drop while DORMANT after end_the_call. Soft reconnect must not OPEN
+        and must not CLOSE: DORMANT stays DORMANT, LISTENING stays LISTENING.
+        end_the_call and the idle hangup still close. Gemini's audio-cache
+        TTL path (base ``_handle_session_dead``) still closes, because that
+        session could not be resumed.
         """
-        was_listening = False
-        try:
-            gate = self._wake_gate
-            if gate is not None:
-                was_listening = gate.close()
-                if was_listening:
-                    self._status.on_wake_closed()
-        except Exception:
-            logger.exception("session-dead wake gate close failed")
+        gate = self._wake_gate
+        state = gate.state.value if gate is not None else "absent"
         try:
             await self._abort_in_flight_tts()
         except Exception:
             logger.exception("session-dead abort tts failed")
         self._nudge_reconnect()
-        if was_listening:
-            self._reported_dead = True
-            try:
-                await self._set_leds_safe(*DEAD_LED_RGB)
-            except Exception:
-                logger.exception("session-dead red LED failed")
-            return
-        # DORMANT silent death: no sticky red; supervisor reconnects quietly.
+        # Do not paint sticky red. That signal used to travel with CLOSE and
+        # made a still-open listen window look unwakeable.
         self._reported_dead = False
         logger.info(
-            "Grok voice session died while DORMANT; supervisor nudged to reconnect"
+            "Grok voice session died (wake_gate=%s); state preserved, supervisor nudged",
+            state,
         )
 
     async def stop(self):

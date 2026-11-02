@@ -353,7 +353,8 @@ async def test_dormant_session_dead_does_not_sticky_red(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_listening_session_dead_still_closes_and_lights_red(monkeypatch):
+async def test_listening_session_dead_keeps_gate_and_skips_sticky_red(monkeypatch):
+    """A dropped Grok socket must not CLOSE a live listen window or paint sticky red."""
     from stackchan_mcp.device_emotion import DEAD_LED_RGB
     from stackchan_mcp.wake_gate import WakeGate, WakeGateState
 
@@ -392,9 +393,9 @@ async def test_listening_session_dead_still_closes_and_lights_red(monkeypatch):
     proxy._stopped = False
 
     await proxy._handle_session_dead()
-    assert gate.state == WakeGateState.DORMANT
-    assert proxy._reported_dead is True
-    assert esp32.leds[-1] == DEAD_LED_RGB
+    assert gate.state == WakeGateState.LISTENING
+    assert proxy._reported_dead is False
+    assert DEAD_LED_RGB not in esp32.leds
 
 
 @pytest.mark.asyncio
@@ -465,6 +466,85 @@ async def test_reconnect_reuses_wake_gate_without_rebuild(monkeypatch):
     assert proxy._wake_gate is gate1
 
     await GeminiVoiceProxy.stop(proxy)  # full teardown
+    assert proxy._wake_gate is None
+
+
+@pytest.mark.asyncio
+async def test_soft_reconnect_preserves_dormant_and_listening(monkeypatch):
+    """Soft reconnect keeps DORMANT dormant and LISTENING listening.
+
+    session_dead, preserve_wake_gate stop, and the following start() must
+    not OPEN or CLOSE the gate. end_the_call / idle hangup still close.
+    """
+    from stackchan_mcp.gemini_voice_proxy import GeminiVoiceProxy
+    from stackchan_mcp.wake_gate import WakeGate, WakeGateState
+
+    creates = {"n": 0}
+
+    class FakeKws:
+        available = True
+
+        def detect(self, pcm):
+            return False
+
+        def reset(self):
+            pass
+
+    def factory():
+        creates["n"] += 1
+        return WakeGate(kws=FakeKws(), idle_s=30.0, activity_rms_threshold=0.0)
+
+    class FakeBridge:
+        def __init__(self, **kwargs):
+            self.metrics = {}
+
+        async def start(self):
+            return None
+
+        async def wait_connected(self, timeout=10.0):
+            return True
+
+        async def stop(self):
+            return None
+
+        async def check_connection(self, timeout=10.0):
+            return True
+
+    proxy = GbotVoiceProxy(
+        wake_gate_factory=factory,
+        bridge_factory=lambda **kwargs: FakeBridge(**kwargs),
+        device_tts_start_delay_s=0,
+        device_frame_pace_ms=0,
+        device_prebuffer_ms=0,
+        debug_status=DebugStatus(),
+    )
+    monkeypatch.setenv("STACKCHAN_WAKE_WORD", "1")
+    hello = SimpleNamespace(device_id="fixture-device")
+    send = lambda *_a, **_k: None
+
+    assert await GeminiVoiceProxy.start(proxy, hello, {}, send)
+    gate = proxy._wake_gate
+    assert creates["n"] == 1
+    assert gate.state == WakeGateState.DORMANT
+
+    async def reconnect_preserving(expected):
+        await proxy._handle_session_dead()
+        assert gate.state == expected
+        assert proxy._reported_dead is False
+        await GeminiVoiceProxy.stop(proxy, preserve_wake_gate=True)
+        assert proxy._wake_gate is gate
+        assert gate.state == expected
+        assert await GeminiVoiceProxy.start(proxy, hello, {}, send)
+        assert creates["n"] == 1
+        assert proxy._wake_gate is gate
+        assert gate.state == expected
+
+    await reconnect_preserving(WakeGateState.DORMANT)
+
+    gate.state = WakeGateState.LISTENING
+    await reconnect_preserving(WakeGateState.LISTENING)
+
+    await GeminiVoiceProxy.stop(proxy)
     assert proxy._wake_gate is None
 
 
