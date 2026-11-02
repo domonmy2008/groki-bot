@@ -453,8 +453,30 @@ class GeminiVoiceProxy:
             gate is not None and not self._wake_gate_passthrough and gate.is_listening
         )
         await self._set_wake_motion(listening)
+        await self._sync_wake_uplink()
 
+    async def _sync_wake_uplink(self, *, allow_active_goodbye: bool = False) -> None:
+        """Keep Grok bridge mute aligned with wake gate (soft reconnect too).
 
+        Wake enabled + DORMANT => hard-block uplink and VAD playback.
+        LISTENING / passthrough / no gate => uplink open.
+        """
+        bridge = self._bridge
+        setter = getattr(bridge, "set_wake_uplink_open", None)
+        if setter is None:
+            return
+        gate = self._wake_gate
+        if (
+            gate is None
+            or self._wake_gate_passthrough
+            or not getattr(gate, "available", False)
+        ):
+            enabled = True
+        else:
+            enabled = bool(gate.is_listening)
+        result = setter(enabled, allow_active_goodbye=allow_active_goodbye)
+        if inspect.isawaitable(result):
+            await result
 
     async def _backup_dormant_home_after_goodbye(self) -> None:
         """Wait out goodbye TTS, then force home once more."""
@@ -742,6 +764,7 @@ class GeminiVoiceProxy:
                 logger.exception("wake-open abort gate close failed")
         if closed:
             self._status.on_wake_closed()
+        await self._sync_wake_uplink()
         await self._signal_manual_vad_end(bridge)
         if not self._tts_active:
             await self._set_leds_safe(0, 0, 0)
@@ -768,6 +791,9 @@ class GeminiVoiceProxy:
         if decision.woke:
             self._status.on_wake_woke()
         if decision.closed:
+            # Mute before clearing so residual frames cannot race into VAD.
+            await self._set_wake_motion(False)
+            await self._sync_wake_uplink()
             await self._signal_manual_vad_end(bridge)
             if not self._tts_active:
                 await self._set_leds_safe(0, 0, 0)
@@ -794,8 +820,7 @@ class GeminiVoiceProxy:
         # are unchanged.
         if decision.woke:
             await self._set_wake_motion(True)
-        elif decision.closed:
-            await self._set_wake_motion(False)
+            await self._sync_wake_uplink()
         for chunk in decision.forward_pcm:
             await bridge.send_audio(chunk)
 
@@ -833,11 +858,18 @@ class GeminiVoiceProxy:
             await self._set_wake_motion(False)
             return
         closed = gate.close()
+        # Mute uplink immediately on hangup; keep goodbye TTS if still draining.
+        await self._sync_wake_uplink(allow_active_goodbye=True)
         if closed:
             self._status.on_wake_closed()
             bridge = self._bridge
             if bridge is not None:
                 await self._signal_manual_vad_end(bridge)
+                clear_context = getattr(bridge, "clear_conversation_context", None)
+                if callable(clear_context):
+                    result = clear_context()
+                    if inspect.isawaitable(result):
+                        await result
             # Do not race LEDs with in-flight goodbye; end_tts / abort paths
             # extinguish via _post_tts_led_rgb once Speaking ends.
             if not self._tts_active:

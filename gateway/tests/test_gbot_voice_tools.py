@@ -672,3 +672,134 @@ async def test_end_the_call_acks_tool_without_requesting_spoken_response(monkeyp
     assert b._drop_until_response is True
     await b.stop()
 
+
+@pytest.mark.asyncio
+async def test_dormant_mute_drops_uplink_frames(monkeypatch):
+    """DORMANT hard-blocks mic PCM so server VAD cannot see post-CLOSE audio."""
+    b = make(monkeypatch)
+    b._send_pcm = AsyncMock()
+    await b.set_wake_uplink_open(False)
+    await b.send_audio(b"\x00\x01" * 16)
+    await b.send_keepalive_audio(b"\x00\x01" * 16)
+    b._send_pcm.assert_not_awaited()
+    # Clear is attempted only when a live WS exists.
+    assert b._wake_uplink_open is False
+    await b.set_wake_uplink_open(True)
+    await b.send_audio(b"\x00\x01" * 16)
+    b._send_pcm.assert_awaited()
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_dormant_mute_ignores_vad_and_suppresses_new_responses(monkeypatch):
+    """After end_the_call/CLOSE, further uplink VAD must not play TTS."""
+    import base64
+
+    b = make(monkeypatch)
+    b._on_end_conversation = AsyncMock()
+    b._configure_tools(
+        {"tools": [{"name": "end_the_call", "parameters": {"type": "object"}}]}
+    )
+    # Simulate an in-flight goodbye response, then hang up.
+    b._active_response = "goodbye"
+    b._response_in_progress = True
+    await b.set_wake_uplink_open(False, allow_active_goodbye=True)
+    assert b._goodbye_response_id == "goodbye"
+
+    played = []
+
+    async def capture(pcm):
+        played.append(pcm)
+
+    b._on_audio = capture
+    # Goodbye deltas still allowed.
+    delta = base64.b64encode(b"bye").decode("ascii")
+    await b._handle_event(
+        {
+            "type": "response.audio.delta",
+            "response_id": "goodbye",
+            "delta": delta,
+        }
+    )
+    assert played == [b"bye"]
+
+    # Residual / phantom VAD while DORMANT must be ignored.
+    b._clear_input_audio_buffer = AsyncMock()
+    b._send = AsyncMock()
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    assert b.metrics.get("speech_starts_ignored_dormant") == 1
+    assert b._user_speaking is False
+    b._clear_input_audio_buffer.assert_awaited()
+
+    # A new cloud response while muted must be suppressed and cancelled.
+    b._send = AsyncMock()
+    await b._handle_event(
+        {
+            "type": "response.created",
+            "response": {"id": "phantom", "metadata": {"trigger": "server_vad"}},
+        }
+    )
+    assert "phantom" in b._suppressed
+    assert b.metrics.get("responses_suppressed_dormant") == 1
+    sent = [c.args[0].get("type") for c in b._send.call_args_list]
+    assert "response.cancel" in sent
+
+    played.clear()
+    await b._handle_event(
+        {
+            "type": "response.audio.delta",
+            "response_id": "phantom",
+            "delta": base64.b64encode(b"nope").decode("ascii"),
+        }
+    )
+    assert played == []
+    assert b.metrics["discarded_audio_deltas"] >= 1
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_end_the_call_then_uplink_stays_muted_without_new_playback(monkeypatch):
+    """end_the_call closes the call; later VAD responses do not create audible TTS."""
+    import base64
+
+    b = make(monkeypatch)
+    b._on_end_conversation = AsyncMock()
+    b._configure_tools(
+        {"tools": [{"name": "end_the_call", "parameters": {"type": "object"}}]}
+    )
+    b._active_response = "bye1"
+    b._response_in_progress = True
+    # Proxy would mute; emulate that after the tool's end callback.
+    async def on_end():
+        await b.set_wake_uplink_open(False, allow_active_goodbye=True)
+
+    b._on_end_conversation = on_end
+    await b._tool({"name": "end_the_call", "call_id": "hangup", "arguments": "{}"})
+    assert b._wake_uplink_open is False
+
+    played = []
+
+    async def capture(pcm):
+        played.append(pcm)
+
+    b._on_audio = capture
+    b._output = type(b._output)()  # fresh queue
+    # Replace output submit path by direct check via _should_play
+    assert b._should_play_response_audio("bye1") is True
+    assert b._should_play_response_audio("later") is False
+
+    await b._handle_event(
+        {
+            "type": "response.created",
+            "response": {"id": "later", "metadata": {"trigger": "server_vad"}},
+        }
+    )
+    await b._handle_event(
+        {
+            "type": "response.audio.delta",
+            "response_id": "later",
+            "delta": base64.b64encode(b"x").decode("ascii"),
+        }
+    )
+    assert played == []
+    await b.stop()

@@ -234,6 +234,11 @@ class GbotVoiceBridge:
         self._active_response = None
         self._response_in_progress = False
         self._drop_until_response = False
+        # Wake-gate hard mute: False while DORMANT (wake enabled). Proxy syncs
+        # this across OPEN/CLOSE and soft reconnect. Default True so passthrough
+        # / unit tests without a wake gate keep working.
+        self._wake_uplink_open = True
+        self._goodbye_response_id = None
         self._resampler = Pcm16To24()
         self._uplink_gain = _float_env("STACKCHAN_GBOT_UPLINK_GAIN", 1.0)
         self._uplink_rms_log = os.getenv("STACKCHAN_GBOT_UPLINK_RMS_LOG", "0").strip() not in {
@@ -576,6 +581,8 @@ class GbotVoiceBridge:
             self._executor.clear_turn_emotion_face()
 
     async def send_keepalive_audio(self, pcm):
+        if not self._wake_uplink_open:
+            return
         await self._send_pcm(pcm)
 
     async def send_activity_start(self):
@@ -585,9 +592,10 @@ class GbotVoiceBridge:
         await self.send_audio_stream_end()
 
     async def clear_conversation_context(self):
-        # A new call owns fresh context; the realtime API has no clear-all verb.
+        # Drop residual mic so a closed wake window cannot fire server VAD.
         self._pending_response = False
         self._cancel_idle()
+        await self._clear_input_audio_buffer()
 
     async def inject_user_text(self, text):
         # Programmatic speech/notices do not grant desktop dispatch authority.
@@ -818,7 +826,57 @@ class GbotVoiceBridge:
             raise RuntimeError("Grok Bot voice is disconnected")
         await self._ws.send_json(event)
 
+    async def set_wake_uplink_open(
+        self, enabled: bool, *, allow_active_goodbye: bool = False
+    ) -> None:
+        """Hard-gate mic uplink and cloud VAD playback to LISTENING.
+
+        DORMANT (enabled=False) drops ``send_audio``, clears the server input
+        buffer, and suppresses new response audio. ``allow_active_goodbye``
+        keeps the in-flight end_the_call TTS response playing out.
+        Soft reconnect must call this again from the preserved gate state.
+        """
+        enabled = bool(enabled)
+        was_open = self._wake_uplink_open
+        self._wake_uplink_open = enabled
+        if enabled:
+            self._goodbye_response_id = None
+            if not was_open:
+                logger.info("Grok voice wake uplink OPEN (LISTENING)")
+            return
+        if allow_active_goodbye and self._active_response:
+            self._goodbye_response_id = self._active_response
+        else:
+            self._goodbye_response_id = None
+        self._user_speaking = False
+        self._pending_response = False
+        if was_open:
+            logger.info(
+                "Grok voice wake uplink MUTED (DORMANT) goodbye_allow=%s",
+                self._goodbye_response_id is not None,
+            )
+        await self._clear_input_audio_buffer()
+
+    async def _clear_input_audio_buffer(self) -> None:
+        if self._ws is None or getattr(self._ws, "closed", True):
+            return
+        try:
+            await self._send({"type": "input_audio_buffer.clear"})
+        except Exception:
+            logger.debug("input_audio_buffer.clear failed", exc_info=True)
+
+    def _should_play_response_audio(self, response_id) -> bool:
+        if response_id and response_id == self._goodbye_response_id:
+            return True
+        if not self._wake_uplink_open:
+            return False
+        if self._drop_until_response or response_id in self._suppressed:
+            return False
+        return True
+
     async def send_audio(self, pcm):
+        if not self._wake_uplink_open:
+            return
         self._cancel_idle()
         await self._send_pcm(pcm)
 
@@ -911,8 +969,47 @@ class GbotVoiceBridge:
             counts[trigger] = counts.get(trigger, 0) + 1
             logger.info("Grok voice response state=created trigger=%s", trigger)
             self.response_started_at[self._active_response] = time.monotonic()
-            self._drop_until_response = False
+            # DORMANT mute: suppress/cancel anything that is not the allowed goodbye.
+            if (
+                not self._wake_uplink_open
+                and self._active_response
+                and self._active_response != self._goodbye_response_id
+            ):
+                self._suppressed.add(self._active_response)
+                self._drop_until_response = True
+                self.metrics["responses_suppressed_dormant"] = (
+                    self.metrics.get("responses_suppressed_dormant", 0) + 1
+                )
+                logger.info(
+                    "Grok voice response suppressed (wake DORMANT mute) trigger=%s",
+                    trigger,
+                )
+                try:
+                    await self._send({"type": "response.cancel"})
+                except Exception:
+                    logger.debug("dormant response.cancel failed", exc_info=True)
+            else:
+                self._drop_until_response = False
         elif kind == "input_audio_buffer.speech_started":
+            if not self._wake_uplink_open:
+                self.metrics["speech_starts_ignored_dormant"] = (
+                    self.metrics.get("speech_starts_ignored_dormant", 0) + 1
+                )
+                logger.info(
+                    "Grok voice uplink VAD ignored (wake DORMANT mute) "
+                    "response_in_progress=%s",
+                    self._response_in_progress,
+                )
+                await self._clear_input_audio_buffer()
+                if self._response_in_progress and (
+                    not self._active_response
+                    or self._active_response != self._goodbye_response_id
+                ):
+                    try:
+                        await self._send({"type": "response.cancel"})
+                    except Exception:
+                        logger.debug("dormant VAD response.cancel failed", exc_info=True)
+                return
             self._response_progress_at = None
             self.metrics["speech_starts"] += 1
             self._user_epoch += 1
@@ -942,7 +1039,7 @@ class GbotVoiceBridge:
                 await self._flush_pending()
         elif kind in {"response.audio.delta", "response.output_audio.delta"}:
             response_id = event.get("response_id") or self._active_response
-            if self._drop_until_response or response_id in self._suppressed:
+            if not self._should_play_response_audio(response_id):
                 self.metrics["discarded_audio_deltas"] += 1
                 return
             self._response_progress_at = time.monotonic()
@@ -975,6 +1072,8 @@ class GbotVoiceBridge:
                 await self._on_text(text)
         elif kind == "response.done":
             response_id = event.get("response", {}).get("id") or self._active_response
+            if response_id == self._goodbye_response_id:
+                self._goodbye_response_id = None
             if response_id != self._active_response:
                 return
             self._response_progress_at = None
