@@ -106,8 +106,8 @@ class NativeVoiceChannel:
     async def _run(self):
         while not self._closed:
             try:
-                self._presence_owned = True
                 await self._presence(True)
+                self._presence_owned = True
                 self._registered = True
                 await self._listen()
             except asyncio.CancelledError:

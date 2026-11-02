@@ -38,6 +38,17 @@ trap cleanup EXIT INT TERM
 
 cd "${GATEWAY_DIR}"
 
+# Export gateway/.env into the process environment. python-dotenv's default
+# load_dotenv() does not override existing vars, so a stale shell export
+# (e.g. STACKCHAN_WAKE_IDLE_S=15) would otherwise win over .env.
+if [[ -f "${GATEWAY_DIR}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${GATEWAY_DIR}/.env"
+    set +a
+fi
+
+
 RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/stackchan-gateway.XXXXXX")"
 STDIN_FIFO="${RUNTIME_DIR}/stdin"
 mkfifo "${STDIN_FIFO}"

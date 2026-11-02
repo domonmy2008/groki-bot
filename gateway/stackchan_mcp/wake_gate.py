@@ -171,7 +171,12 @@ class SherpaOnnxKeywordSpotter:
         if not result:
             return False
         self._spotter.reset_stream(self._stream)
-        return self._result_matches(result)
+        # stackchan_keywords.txt only lists our wake entries, so any spotter
+        # hit opens the gate — including @name variants that do not literally
+        # contain STACKCHAN_WAKE_PHRASE (e.g. tone / 嗨阿吉 aliases).
+        if not self._result_matches(result):
+            logger.info("KWS hit result=%r accepted (phrase=%r)", result, self._phrase)
+        return True
 
     def _result_matches(self, result: str) -> bool:
         if self._phrase in result:
@@ -278,6 +283,7 @@ class WakeGate:
             self._listening_window_anchor = now
             forward = tuple(self._preroll)
             self._clear_preroll()
+            logger.info("wake gate OPEN -> LISTENING (KWS restarts only after CLOSE)")
             return WakeGateResult(forward_pcm=forward, woke=True, closed=closed)
 
         if pcm_rms_int16(pcm_16khz) >= self.activity_rms_threshold:
@@ -524,6 +530,14 @@ def keywords_file_body(keyword: str) -> str:
         variants = WAKE_KEYWORD_VARIANTS
     elif wanted == HEY_GROKI_WAKE_KEYWORD:
         variants = HEY_GROKI_WAKE_KEYWORD_VARIANTS
+    else:
+        extra = os.getenv("STACKCHAN_WAKE_KEYWORD_VARIANTS", "")
+        if extra.strip():
+            variants = tuple(
+                part.strip()
+                for part in extra.replace("\n", "|").split("|")
+                if part.strip()
+            )
     return "".join(f"{line}\n" for line in (wanted, *variants))
 
 

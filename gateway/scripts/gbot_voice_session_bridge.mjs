@@ -20,14 +20,22 @@ export const RPC_ROUTES = Object.freeze({
   'POST /tool': 'VoiceCallHarnessTool',
 });
 
+// Local patch: cache Safe Storage password so gateway retries don't re-hit Keychain UI.
+let cachedSafeStoragePassword;
+function readSafeStoragePassword() {
+  if (cachedSafeStoragePassword) return cachedSafeStoragePassword;
+  cachedSafeStoragePassword = execFileSync('/usr/bin/security', ['find-generic-password', '-w', '-s', 'Grok Bot Safe Storage'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10000,
+  }).trimEnd();
+  return cachedSafeStoragePassword;
+}
+
 export function loadAccount() {
   const data = JSON.parse(readFileSync(join(homedir(), 'Library/Application Support/Grok Bot/sand-secrets.json'), 'utf8'));
   const accounts = JSON.parse(data['cursor-accounts']);
   const active = accounts.accounts[accounts.active];
   if (!active) throw new Error('login_unavailable');
-  const password = execFileSync('/usr/bin/security', ['find-generic-password', '-w', '-s', 'Grok Bot Safe Storage'], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10000,
-  }).trimEnd();
+  const password = readSafeStoragePassword();
   const key = pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1');
   const decrypt = (value) => {
     const blob = Buffer.from(value, 'base64');
@@ -396,7 +404,16 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       if (nativePresence) {
         if (presenceBusy) return send(409, {ok: false, error: 'presence_busy'});
         if (!activeCall && !body.isOnTheLine) return send(403, {ok: false, error: 'call_not_allowed'});
-        if (activeCall && body.callId !== activeCall.callId) return send(409, {ok: false, error: 'call_conflict'});
+        // Gateway hard-restarts often skip presence(false), leaving a stale activeCall.
+        // Localhost event streams can also linger half-open after the gateway dies, so
+        // streams.size>0 is not proof another live owner exists. Force-takeover on a new
+        // on-the-line callId: abort leftover consumers, then claim the line.
+        if (activeCall && body.callId !== activeCall.callId) {
+          if (!body.isOnTheLine) return send(409, {ok: false, error: 'call_conflict'});
+          for (const controller of [...streams]) controller.abort();
+          streams.clear();
+          activeCall = null;
+        }
         presenceBusy = true;
         try {
         const authId = await sandbox.callerAuthId();

@@ -72,6 +72,40 @@ test('native event filtering excludes history, other callers, sessions and dupli
   assert.equal(filterNativeEvent({channel:'voice-call-nudge',payload:{agentId:'a',callId:'other',kind:'outcome',update:'fake'}},context),null);
 });
 
+
+test('stale activeCall can be taken over after gateway restart even with leftover event streams', async () => {
+  const port = await freePort(); let presenceCalls=0;
+  const sandbox={
+    callerAuthId:async()=> 'owner',
+    presence:async()=>{presenceCalls++;},
+    openEvents: async signal => new Response(new ReadableStream({start(controller) {
+      signal.addEventListener('abort', () => controller.close(), {once:true});
+    }}), {headers:{'content-type':'text/event-stream'}}),
+  };
+  const transcript = {async *events(_context, signal, onOpen) {
+    onOpen(200);
+    await new Promise(resolve => signal.addEventListener('abort', resolve, {once:true}));
+  }};
+  const server=createBridge({port,agentId:'a',desktopEnabled:true,toolsEnabled:false,sandbox,transcript});
+  await new Promise(r=>server.listen(port,'127.0.0.1',r));
+  const post=async(path,body)=>fetch(`http://127.0.0.1:${port}`+path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  let reader;
+  try {
+    assert.equal((await post('/native/presence',{agentId:'a',callId:'old-call',isOnTheLine:true,acceptsOverheard:false})).status,200);
+    const response = await fetch(`http://127.0.0.1:${port}/native/events?agentId=a&callId=old-call`);
+    reader = response.body.getReader();
+    await reader.read();
+    // Simulate gateway hard restart while the old SSE consumer is still half-open.
+    assert.equal((await post('/native/presence',{agentId:'a',callId:'new-call',isOnTheLine:true,acceptsOverheard:false})).status,200);
+    assert.equal(presenceCalls,2);
+    assert.equal((await post('/native/presence',{agentId:'a',callId:'new-call',isOnTheLine:false,acceptsOverheard:false})).status,200);
+  } finally {
+    await reader?.cancel().catch(()=>{});
+    server.closeAllConnections();
+    await new Promise(r=>server.close(r));
+  }
+});
+
 test('desktop opt-in admits native send and search scoped to active call while unknown tools remain off', async () => {
   const port = await freePort(); let toolCalls=0, presenceCalls=0;
   const sandbox={callerAuthId:async()=> 'owner', presence:async()=>{presenceCalls++;}};

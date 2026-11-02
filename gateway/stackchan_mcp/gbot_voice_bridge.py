@@ -27,6 +27,45 @@ from .gbot_native_channel import NativeVoiceChannel
 logger = logging.getLogger(__name__)
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
+def apply_pcm16_gain(pcm: bytes, gain: float) -> bytes:
+    """Scale int16 LE PCM by gain and clip. gain<=0 or ~=1 returns pcm unchanged."""
+    if not pcm or gain <= 0 or abs(gain - 1.0) < 1e-6:
+        return pcm
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+    out = [
+        32767 if (v := int(round(s * gain))) > 32767 else -32768 if v < -32768 else v
+        for s in samples
+    ]
+    return struct.pack(f"<{len(out)}h", *out)
+
+
+def pcm16_rms(pcm: bytes) -> float:
+    if len(pcm) < 2:
+        return 0.0
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+    if not samples:
+        return 0.0
+    acc = 0.0
+    for s in samples:
+        acc += float(s) * float(s)
+    return (acc / len(samples)) ** 0.5
+
+
 class Pcm16To24:
     """Streaming linear resampler, preserving interpolation across Opus packets."""
 
@@ -195,6 +234,23 @@ class GbotVoiceBridge:
         self._response_in_progress = False
         self._drop_until_response = False
         self._resampler = Pcm16To24()
+        self._uplink_gain = _float_env("STACKCHAN_GBOT_UPLINK_GAIN", 1.0)
+        self._uplink_rms_log = os.getenv("STACKCHAN_GBOT_UPLINK_RMS_LOG", "0").strip() not in {
+            "",
+            "0",
+            "false",
+            "False",
+            "no",
+            "NO",
+        }
+        self._uplink_rms_last_log_at = 0.0
+        self._uplink_rms_peak = 0.0
+        if abs(self._uplink_gain - 1.0) > 1e-6 or self._uplink_rms_log:
+            logger.info(
+                "Grok voice uplink gain=%.3f rms_log=%s (STACKCHAN_GBOT_UPLINK_GAIN)",
+                self._uplink_gain,
+                self._uplink_rms_log,
+            )
         self._stopped = False
         self.running = False
         self.metrics = {
@@ -534,6 +590,12 @@ class GbotVoiceBridge:
         # Programmatic speech/notices do not grant desktop dispatch authority.
         if self._stopped:
             return False
+        # Avoid racing server_vad / an in-flight reply: concurrent response.create
+        # yields invalid_request_error and the user hears no audio for that turn.
+        if self._response_in_progress or self._user_speaking or (
+            self._turn_task and not self._turn_task.done()
+        ):
+            await self.interrupt()
         await self._send(
             {
                 "type": "conversation.item.create",
@@ -758,7 +820,23 @@ class GbotVoiceBridge:
         await self._send_pcm(pcm)
 
     async def _send_pcm(self, pcm):
-        audio = self._resampler.convert(pcm)
+        if self._uplink_rms_log or abs(self._uplink_gain - 1.0) > 1e-6:
+            now = time.monotonic()
+            rms = pcm16_rms(pcm)
+            if rms > self._uplink_rms_peak:
+                self._uplink_rms_peak = rms
+            if now - self._uplink_rms_last_log_at >= 5.0:
+                self._uplink_rms_last_log_at = now
+                logger.info(
+                    "Grok voice uplink rms=%.1f peak=%.1f post_gain~%.1f gain=%.3f bytes=%d",
+                    rms,
+                    self._uplink_rms_peak,
+                    self._uplink_rms_peak * self._uplink_gain,
+                    self._uplink_gain,
+                    len(pcm),
+                )
+                self._uplink_rms_peak = 0.0
+        audio = self._resampler.convert(apply_pcm16_gain(pcm, self._uplink_gain))
         if audio:
             await self._send(
                 {
@@ -837,6 +915,11 @@ class GbotVoiceBridge:
             self._user_epoch += 1
             self._user_speaking = True
             self._cancel_idle()
+            logger.info(
+                "Grok voice uplink VAD state=started user_epoch=%d response_in_progress=%s",
+                self._user_epoch,
+                self._response_in_progress,
+            )
             if self._response_in_progress or (
                 self._turn_task and not self._turn_task.done()
             ):
@@ -844,6 +927,11 @@ class GbotVoiceBridge:
         elif kind == "input_audio_buffer.speech_stopped":
             self._response_progress_at = time.monotonic()
             self._user_speaking = False
+            logger.info(
+                "Grok voice uplink VAD state=stopped user_epoch=%d pending_response=%s",
+                self._user_epoch,
+                self._pending_response,
+            )
             # Native completions must not depend on a subsequent VAD response.
             # Leave ordinary response.create requests to their normal path.
             if self._pending_updates:
@@ -941,6 +1029,14 @@ class GbotVoiceBridge:
             errors = self.metrics["server_errors"]
             errors[key] = errors.get(key, 0) + 1
             logger.warning("Grok Bot voice server error code=%s param=%s", code, param)
+            if code == "invalid_request_error":
+                # A rejected response.create must not leave manual-response
+                # gates stuck closed for the rest of the call.
+                self._pending_response = False
+                self._response_requested = False
+                if not self._user_speaking:
+                    self._response_in_progress = False
+                    self._response_progress_at = None
 
     async def _tool(self, event):
         call_id = event.get("call_id")

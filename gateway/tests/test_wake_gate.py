@@ -644,4 +644,18 @@ def test_hey_groki_phrase_switches_to_the_optional_keyword(monkeypatch, tmp_path
 def test_custom_wake_keyword_is_written_alone(monkeypatch) -> None:
     from stackchan_mcp.wake_gate import keywords_file_body
 
+    monkeypatch.delenv("STACKCHAN_WAKE_KEYWORD_VARIANTS", raising=False)
     assert keywords_file_body("HH EH1 L OW0 @hello") == "HH EH1 L OW0 @hello\n"
+
+
+def test_custom_wake_keyword_variants_from_env(monkeypatch) -> None:
+    from stackchan_mcp.wake_gate import keywords_file_body
+
+    monkeypatch.setenv(
+        "STACKCHAN_WAKE_KEYWORD_VARIANTS",
+        "HH AY1 ā j ì @Hi_阿吉_ji4|h āi ā j í @Hi_阿吉_hai",
+    )
+    body = keywords_file_body("HH AY1 ā j í @Hi_阿吉")
+    assert body.startswith("HH AY1 ā j í @Hi_阿吉\n")
+    assert "Hi_阿吉_ji4" in body
+    assert "Hi_阿吉_hai" in body
