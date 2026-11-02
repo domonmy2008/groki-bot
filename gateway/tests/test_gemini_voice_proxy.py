@@ -1951,3 +1951,31 @@ async def test_wake_gate_permanent_failure_reports_unavailable(monkeypatch, info
         assert snap["state"] == "UNAVAILABLE"
     finally:
         await proxy.stop()
+
+
+@pytest.mark.asyncio
+async def test_closed_socket_holds_tts_for_replay():
+    """A 1011 on tts.start keeps the generated Opus instead of dropping it."""
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+
+    proxy = GeminiVoiceProxy()
+    proxy.device_tts_start_delay_s = 0
+    proxy.device_frame_pace_ms = 0
+
+    async def send(_payload):
+        raise ConnectionClosed(Close(1011, "keepalive ping timeout"), None)
+
+    proxy._send_to_device = send
+    try:
+        queued = await proxy._queue_tts_frames([b"frame-a", b"frame-b"])
+        assert queued is True
+        await proxy._stop_drain_task(cancel=True)
+        held = proxy.take_undelivered_tts()
+        assert b"frame-a" in held
+        assert b"frame-b" in held
+        text = [item for item in held if isinstance(item, str)]
+        assert any(json.loads(item).get("state") == "start" for item in text)
+    finally:
+        proxy._send_to_device = None
+        await proxy.stop()

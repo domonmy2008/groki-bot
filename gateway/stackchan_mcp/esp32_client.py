@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -28,6 +29,137 @@ logger = logging.getLogger(__name__)
 
 # Timeout for waiting for ESP32 responses
 RESPONSE_TIMEOUT = 300.0
+
+# Device-socket keepalive. websockets defaults (20s / 20s, queue of 16)
+# pause reading once a short Opus burst fills the queue, then miss pongs
+# and close with 1011. 60s leaves room for a slow voice connect; the queue
+# holds about eight seconds of 60 ms uplink before backpressure.
+_DEFAULT_WS_PING_INTERVAL_S = 60.0
+_DEFAULT_WS_PING_TIMEOUT_S = 60.0
+_DEFAULT_WS_MAX_QUEUE = 128
+_DEFAULT_HELLO_VOICE_WAIT_S = 2.0
+_DEFAULT_UPLINK_PREROLL_FRAMES = 400
+_DEFAULT_TTS_REPLAY_TTL_S = 45.0
+_TTS_REPLAY_BURST_FRAMES = 6
+_TTS_REPLAY_PACE_S = 0.06
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
+def websocket_server_options() -> dict[str, Any]:
+    """Keepalive settings for the device WebSocket server.
+
+    ``STACKCHAN_WS_PING_INTERVAL`` / ``STACKCHAN_WS_PING_TIMEOUT`` are seconds.
+    ``0`` disables that limit (``None`` in websockets). ``STACKCHAN_WS_MAX_QUEUE``
+    is the incoming frame high-water mark; ``0`` disables flow control.
+    """
+    ping_interval = _env_float("STACKCHAN_WS_PING_INTERVAL", _DEFAULT_WS_PING_INTERVAL_S)
+    ping_timeout = _env_float("STACKCHAN_WS_PING_TIMEOUT", _DEFAULT_WS_PING_TIMEOUT_S)
+    max_queue = _env_int("STACKCHAN_WS_MAX_QUEUE", _DEFAULT_WS_MAX_QUEUE)
+    return {
+        "ping_interval": ping_interval if ping_interval > 0 else None,
+        "ping_timeout": ping_timeout if ping_timeout > 0 else None,
+        "max_queue": max_queue if max_queue > 0 else None,
+    }
+
+
+def hello_voice_wait_s() -> float:
+    """How long hello may block the read loop while voice connects.
+
+    The rest of the connect continues in the background. ``0`` answers hello
+    immediately. Override with ``STACKCHAN_HELLO_VOICE_WAIT_S``.
+    """
+    return max(0.0, _env_float("STACKCHAN_HELLO_VOICE_WAIT_S", _DEFAULT_HELLO_VOICE_WAIT_S))
+
+
+def uplink_preroll_limit() -> int:
+    """Opus frames kept while voice is still connecting. ``0`` means unlimited."""
+    return max(0, _env_int("STACKCHAN_UPLINK_PREROLL_FRAMES", _DEFAULT_UPLINK_PREROLL_FRAMES))
+
+
+def tts_replay_ttl_s() -> float:
+    """How long undelivered TTS is eligible for replay. ``<=0`` disables it."""
+    return _env_float("STACKCHAN_TTS_REPLAY_TTL_S", _DEFAULT_TTS_REPLAY_TTL_S)
+
+
+def trim_pending_audio(pending: list[tuple[str, Any]], limit: int) -> int:
+    """Drop the oldest binary frames until at most ``limit`` remain.
+
+    JSON control messages stay in place so ``listen`` / ``abort`` are not
+    discarded ahead of the audio they describe. ``limit <= 0`` keeps everything.
+    Returns the number of frames dropped.
+    """
+    if limit <= 0:
+        return 0
+    binary_indexes = [index for index, item in enumerate(pending) if item[0] == "bin"]
+    extra = len(binary_indexes) - limit
+    if extra <= 0:
+        return 0
+    drop = set(binary_indexes[:extra])
+    pending[:] = [item for index, item in enumerate(pending) if index not in drop]
+    return extra
+
+
+def _frame_code_reason(frame: Any) -> tuple[Any, str]:
+    if frame is None:
+        return None, ""
+    reason = getattr(frame, "reason", "") or ""
+    return getattr(frame, "code", None), str(reason)
+
+
+def format_connection_closed(exc: BaseException) -> str:
+    """Include both close frames so a 1011 keepalive timeout is visible."""
+    rcvd_code, rcvd_reason = _frame_code_reason(getattr(exc, "rcvd", None))
+    sent_code, sent_reason = _frame_code_reason(getattr(exc, "sent", None))
+    return (
+        f"rcvd_code={rcvd_code} rcvd_reason={rcvd_reason!r} "
+        f"sent_code={sent_code} sent_reason={sent_reason!r}"
+    )
+
+
+def _tts_state(payload: str | bytes) -> str | None:
+    if isinstance(payload, (bytes, bytearray)):
+        return None
+    try:
+        message = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(message, dict) or message.get("type") != "tts":
+        return None
+    state = message.get("state")
+    return str(state) if state else None
+
+
+def bracket_tts_payloads(payloads: list[Any]) -> list[Any]:
+    """Ensure a replay starts and ends in the Speaking state the firmware expects."""
+    states = [_tts_state(payload) for payload in payloads]
+    bracketed = list(payloads)
+    if "start" not in states:
+        bracketed.insert(0, json.dumps({"type": "tts", "state": "sentence_start", "text": ""}))
+        bracketed.insert(0, json.dumps({"type": "tts", "state": "start"}))
+    if "stop" not in states:
+        bracketed.append(json.dumps({"type": "tts", "state": "stop"}))
+    return bracketed
 
 
 def _require_cloud_speak() -> bool:
@@ -343,6 +475,10 @@ class ESP32Manager:
         self._tts_lock = asyncio.Lock()
         self._cloud_proxy_factory = cloud_proxy_factory or CloudProxy
         self._local_tool_handler = local_tool_handler
+        # TTS the device never heard because its socket closed (often 1011).
+        # Replayed once on the next hello for the same device, while still fresh.
+        self._undelivered_tts: dict[str, Any] | None = None
+        self._tts_epoch = 0
         self.on_activity: Callable[[], None] | None = None
         self.on_head_command: Callable[[], None] | None = None
         self.on_device_state: Callable[[str], None] | None = None
@@ -404,18 +540,29 @@ class ESP32Manager:
         """Start the WebSocket server for ESP32 connections."""
         self._vision_url = vision_url
         self._vision_token = vision_token
-        logger.info("ESP32 WebSocket server starting on ws://%s:%d", host, port)
+        options = websocket_server_options()
+        logger.info(
+            "ESP32 WebSocket server starting on ws://%s:%d ping_interval=%s ping_timeout=%s max_queue=%s",
+            host,
+            port,
+            options["ping_interval"],
+            options["ping_timeout"],
+            options["max_queue"],
+        )
         self._server = await websockets.serve(
             self._handler,
             host,
             port,
             process_request=self._check_auth,
+            **options,
         )
 
     async def stop(self) -> None:
         """Stop the WebSocket server."""
-        # Cancel any pending initialization tasks
-        for task in self._init_tasks:
+        # Cancel any pending initialization / replay tasks, then let the
+        # sockets close before joining those tasks so their handlers can finish.
+        tasks = list(self._init_tasks)
+        for task in tasks:
             task.cancel()
         self._init_tasks.clear()
 
@@ -423,6 +570,13 @@ class ESP32Manager:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+
+        leftover = [task for task in self._init_tasks if task not in tasks]
+        for task in leftover:
+            task.cancel()
+        self._init_tasks.clear()
+        if tasks or leftover:
+            await asyncio.gather(*tasks, *leftover, return_exceptions=True)
 
     def _check_auth(
         self, connection: ServerConnection, request: websockets.http11.Request
@@ -461,11 +615,76 @@ class ESP32Manager:
         connection.device_id = device_id
         cloud_proxy: CloudProxy | None = self._cloud_proxy_factory()
         connection.cloud_proxy = cloud_proxy
+        # Voice connect used to be awaited here for its full duration (Grok
+        # can take tens of seconds). That stalls this read loop; once Opus
+        # arrives the websockets queue hits max_queue, reading pauses, and
+        # the server keepalive misses pongs (close 1011). Start voice in the
+        # background, wait only a short budget, and buffer early uplink.
+        self._tts_epoch += 1
+        tts_epoch = self._tts_epoch
+        voice_task: asyncio.Task | None = None
+        uplink_lock = asyncio.Lock()
+        pending_uplink: list[tuple[str, Any]] = []
+        voice_ready = cloud_proxy is None
+        uplink_dropped = 0
+
+        async def defer_uplink(kind: str, payload: Any) -> bool:
+            nonlocal uplink_dropped
+            async with uplink_lock:
+                if voice_ready:
+                    return False
+                pending_uplink.append((kind, payload))
+                uplink_dropped += trim_pending_audio(pending_uplink, uplink_preroll_limit())
+                return True
+
+        async def flush_uplink() -> None:
+            nonlocal voice_ready, pending_uplink, uplink_dropped
+            dropped = 0
+            while True:
+                async with uplink_lock:
+                    if not pending_uplink:
+                        voice_ready = True
+                        dropped = uplink_dropped
+                        uplink_dropped = 0
+                        break
+                    batch = pending_uplink
+                    pending_uplink = []
+                for kind, payload in batch:
+                    try:
+                        if kind == "bin":
+                            await handle_audio_frame(
+                                payload,
+                                session_id,
+                                cloud_proxy=cloud_proxy,
+                            )
+                        elif cloud_proxy is not None:
+                            await cloud_proxy.send_device_json(payload)
+                    except Exception:
+                        logger.warning("buffered uplink forward failed", exc_info=True)
+            if dropped:
+                logger.info(
+                    "dropped %d preroll opus frames while voice was connecting device=%s",
+                    dropped,
+                    device_id,
+                )
+
+        async def start_voice(device_hello: dict[str, Any]) -> None:
+            assert cloud_proxy is not None
+            cloud_info = CloudConnectionInfo.from_headers(request_headers)
+            try:
+                await cloud_proxy.start(cloud_info, device_hello, ws.send)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("voice connect failed device=%s", device_id, exc_info=True)
+            await flush_uplink()
 
         try:
             async for message in ws:
                 if isinstance(message, bytes):
                     self._debug_status.on_device_audio()
+                    if await defer_uplink("bin", message):
+                        continue
                     await handle_audio_frame(
                         message,
                         session_id,
@@ -525,15 +744,33 @@ class ESP32Manager:
                             connection.protocol_version,
                         )
 
-                    if cloud_proxy is not None:
-                        cloud_info = CloudConnectionInfo.from_headers(request_headers)
-                        await cloud_proxy.start(cloud_info, data, ws.send)
+                    if cloud_proxy is not None and (voice_task is None or voice_task.done()):
+                        voice_task = asyncio.create_task(
+                            start_voice(data),
+                            name="esp32-voice-start",
+                        )
+                        wait_s = hello_voice_wait_s()
+                        if wait_s > 0:
+                            try:
+                                await asyncio.wait_for(asyncio.shield(voice_task), timeout=wait_s)
+                            except asyncio.TimeoutError:
+                                logger.info(
+                                    "voice connect still running after %.1fs; sending hello device=%s",
+                                    wait_s,
+                                    device_id,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "voice connect failed before hello device=%s",
+                                    device_id,
+                                    exc_info=True,
+                                )
 
-                    # Send hello response only after the cloud socket has had a
-                    # chance to connect and receive the ESP32 hello.  The ESP32
-                    # starts streaming wake-word Opus immediately after server
-                    # hello; replying too early drops the first listen/audio
-                    # frames while the upstream cloud WebSocket is still opening.
+                    # Answer hello after a short budget even if voice is still
+                    # connecting. The device starts uplink only after this
+                    # response; those frames are buffered until the background
+                    # connect finishes instead of being dropped or stalling
+                    # this loop.
                     resp = HelloResponse(session_id=session_id)
                     await ws.send(resp.model_dump_json())
 
@@ -550,13 +787,13 @@ class ESP32Manager:
                         self._connection = connection
                         self._debug_status.on_device_connected(device_id)
 
+                    self._schedule_background(self._replay_undelivered_tts(ws, device_id, tts_epoch))
+
                     if mcp_supported:
                         # Start initialization as a separate task so the read
                         # loop continues to pump messages (responses to
                         # initialize/tools_list)
-                        task = asyncio.create_task(self._init_device(connection, device_id))
-                        self._init_tasks.append(task)
-                        task.add_done_callback(lambda t: self._init_tasks.remove(t) if t in self._init_tasks else None)
+                        self._schedule_background(self._init_device(connection, device_id))
                     else:
                         logger.info("ESP32 ready (voice-only): device=%s", device_id)
 
@@ -565,27 +802,51 @@ class ESP32Manager:
                         await self._handle_external_mcp_request(ws, data, session_id)
                         continue
 
-                    # MCP response from ESP32
+                    # MCP response from ESP32. Never defer these: initialize
+                    # and tools/list futures are waiting on the read loop.
                     if cloud_proxy is not None and await cloud_proxy.try_handle_device_mcp(data):
                         continue
                     payload = data.get("payload", {})
                     handled_locally = connection.handle_response(payload)
                     if not handled_locally and cloud_proxy is not None:
-                        await cloud_proxy.send_device_json(data)
+                        if not await defer_uplink("json", data):
+                            await cloud_proxy.send_device_json(data)
 
                 else:
                     if cloud_proxy is not None:
+                        if await defer_uplink("json", data):
+                            continue
                         forwarded = await cloud_proxy.send_device_json(data)
                         if forwarded:
                             logger.debug("ESP32 message type=%s forwarded to cloud", msg_type)
                             continue
                     logger.debug("ESP32 message type=%s (ignored)", msg_type)
 
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("ESP32 disconnected: device=%s", device_id)
+        except websockets.exceptions.ConnectionClosed as exc:
+            logger.info(
+                "ESP32 disconnected: device=%s %s",
+                device_id,
+                format_connection_closed(exc),
+            )
         finally:
+            if voice_task is not None and not voice_task.done():
+                voice_task.cancel()
+            if voice_task is not None:
+                await asyncio.gather(voice_task, return_exceptions=True)
             if cloud_proxy is not None:
-                await cloud_proxy.stop()
+                try:
+                    await cloud_proxy.stop()
+                except Exception:
+                    logger.warning("voice proxy stop failed device=%s", device_id, exc_info=True)
+                take = getattr(cloud_proxy, "take_undelivered_tts", None)
+                if callable(take):
+                    try:
+                        undelivered = list(take() or [])
+                    except Exception:
+                        logger.warning("reading undelivered TTS failed", exc_info=True)
+                        undelivered = []
+                    if undelivered:
+                        self._remember_undelivered_tts(device_id, undelivered, tts_epoch)
             connection.disconnect()
             async with self._lock:
                 if self._connection is connection:
@@ -593,6 +854,116 @@ class ESP32Manager:
                     self._debug_status.on_device_disconnected()
                     self._debug_status.on_tts_state(False, source="local")
                     self._debug_status.on_tts_state(False, source="device")
+
+    def _schedule_background(self, coro: Awaitable[Any]) -> asyncio.Task:
+        """Run work that must not stall the device read loop."""
+        task = asyncio.create_task(coro)
+        self._init_tasks.append(task)
+        task.add_done_callback(
+            lambda done: self._init_tasks.remove(done) if done in self._init_tasks else None
+        )
+        return task
+
+    def _remember_undelivered_tts(self, device_id: str, payloads: list[Any], epoch: int) -> None:
+        """Keep generated audio that the closed socket could not accept."""
+        if not payloads:
+            return
+        ttl = tts_replay_ttl_s()
+        if ttl <= 0:
+            logger.info(
+                "dropping %d undelivered TTS payloads (replay disabled) device=%s",
+                len(payloads),
+                device_id,
+            )
+            return
+        bracketed = bracket_tts_payloads(payloads)
+        existing = self._undelivered_tts
+        if (
+            existing is not None
+            and existing.get("device_id") == device_id
+            and int(existing.get("epoch", -1)) == epoch
+            and time.monotonic() <= float(existing.get("deadline", 0))
+        ):
+            bracketed = list(existing.get("payloads") or []) + bracketed
+        self._undelivered_tts = {
+            "device_id": device_id,
+            "payloads": bracketed,
+            "deadline": time.monotonic() + ttl,
+            "epoch": epoch,
+        }
+        logger.info(
+            "queued %d TTS payloads for replay after reconnect device=%s",
+            len(bracketed),
+            device_id,
+        )
+
+    def _claim_undelivered_tts(self, epoch: int) -> dict[str, Any] | None:
+        """Take audio stored by an older connection, leaving this one alone."""
+        pending = self._undelivered_tts
+        if not pending:
+            return None
+        if int(pending.get("epoch", -1)) >= epoch:
+            return None
+        self._undelivered_tts = None
+        return pending
+
+    async def _replay_undelivered_tts(
+        self,
+        ws: ServerConnection,
+        device_id: str,
+        epoch: int,
+    ) -> None:
+        """Play audio that was generated before the previous socket closed."""
+        # The previous handler records audio in its finally block, which can
+        # still be running when this socket's hello arrives. Audio stored
+        # under this connection's own epoch is left for the next hello.
+        pending = self._claim_undelivered_tts(epoch)
+        if pending is None:
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+                pending = self._claim_undelivered_tts(epoch)
+                if pending is not None:
+                    break
+        if not pending:
+            return
+        held_for = str(pending.get("device_id") or "")
+        if held_for != device_id and held_for != "unknown" and device_id != "unknown":
+            if self._undelivered_tts is None:
+                self._undelivered_tts = pending
+            logger.info(
+                "skip TTS replay: held for device=%s, connected device=%s",
+                held_for,
+                device_id,
+            )
+            return
+        if time.monotonic() > float(pending.get("deadline", 0)):
+            self._undelivered_tts = None
+            logger.info("dropping stale TTS replay device=%s", device_id)
+            return
+        payloads = list(pending.get("payloads") or [])
+        self._undelivered_tts = None
+        if not payloads:
+            return
+        logger.info("replaying %d TTS payloads device=%s", len(payloads), device_id)
+        audio_frames = 0
+        try:
+            # Let the device finish its hello handler before Speaking begins.
+            await asyncio.sleep(0.05)
+            async with self._tts_lock:
+                for payload in payloads:
+                    await ws.send(payload)
+                    if isinstance(payload, (bytes, bytearray)):
+                        audio_frames += 1
+                        if audio_frames > _TTS_REPLAY_BURST_FRAMES:
+                            await asyncio.sleep(_TTS_REPLAY_PACE_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "TTS replay failed device=%s %s",
+                device_id,
+                format_connection_closed(exc) if hasattr(exc, "rcvd") or hasattr(exc, "sent") else exc,
+            )
 
     async def _init_device(self, connection: ESP32Connection, device_id: str) -> None:
         """Initialize MCP session with a newly connected device."""

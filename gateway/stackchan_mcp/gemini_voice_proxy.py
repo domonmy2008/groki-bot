@@ -49,8 +49,32 @@ from .wake_gate import LISTENING_LED_RGB, WakeGate, create_wake_gate_from_env
 
 logger = logging.getLogger(__name__)
 
+# Cap a replay so a long turn cannot grow without bound if the device stays gone.
+_HELD_TTS_LIMIT = 800
 
 SendToDevice = Callable[[str | bytes], Awaitable[None]]
+
+
+def _close_details(exc: BaseException) -> str:
+    parts: list[str] = []
+    for label, frame in (("rcvd", getattr(exc, "rcvd", None)), ("sent", getattr(exc, "sent", None))):
+        if frame is None:
+            continue
+        parts.append(
+            f"{label}_code={getattr(frame, 'code', None)} "
+            f"{label}_reason={getattr(frame, 'reason', '')!r}"
+        )
+    return " ".join(parts) or str(exc)
+
+
+def _is_closed_socket(exc: BaseException) -> bool:
+    """True for a device WebSocket that is already gone, including keepalive 1011."""
+    if isinstance(exc, (ConnectionError, BrokenPipeError, ConnectionResetError)):
+        return True
+    if type(exc).__name__.startswith("ConnectionClosed"):
+        return True
+    text = str(exc).lower()
+    return "keepalive ping timeout" in text or "connection closed" in text
 
 
 # Marker stamped into ``server_hello`` so other components (e.g. orchestrator
@@ -165,6 +189,9 @@ class GeminiVoiceProxy:
     )
     _pcm_prebuffer: bytearray = field(default_factory=bytearray)
     _prebuffer_satisfied: bool = False
+    # Downlink the device socket refused (closed, often 1011). Kept until the
+    # connection handler asks for it, then replayed on the next hello.
+    _held_downlink: list[str | bytes] | None = None
     # Even past the prebuffer threshold, Gemini keeps streaming PCM in bursty
     # gulps. Feeding the device buffer at Gemini's irregular pace makes the
     # speaker underrun mid-sentence. A drain task pulls encoded frames off
@@ -837,24 +864,24 @@ class GeminiVoiceProxy:
         self._tts_tasks.difference_update(tasks)
 
     async def _stop_drain_task(self, cancel: bool = False) -> None:
-        """Tear down the drain task and discard any leftover frames.
+        """Tear down the drain task.
 
         ``cancel=True`` is the hard path used by abort/stop; ``cancel=False``
         just signals stop and waits (used when end_tts joined the queue).
+        Frames still queued when the device socket is already closed are
+        kept for replay instead of being discarded.
         """
         task = self._drain_task
         self._drain_task = None
-        if task is None or task.done():
-            self._frame_queue = asyncio.Queue()
-            self._drain_stop = asyncio.Event()
-            return
-        self._drain_stop.set()
-        if cancel:
-            task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception) as exc:
-            logger.debug("drain task teardown: %s", exc)
+        if task is not None and not task.done():
+            self._drain_stop.set()
+            if cancel:
+                task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception) as exc:
+                logger.debug("drain task teardown: %s", exc)
+        self._capture_unsent_audio()
         # Fresh queue + event so the next turn starts clean.
         self._frame_queue = asyncio.Queue()
         self._drain_stop = asyncio.Event()
@@ -965,7 +992,9 @@ class GeminiVoiceProxy:
                 )
             except asyncio.TimeoutError:
                 continue
-            if pace_s > 0:
+            # Once the socket is dead, dump the rest into the replay hold
+            # instead of pacing out a turn nobody can hear.
+            if pace_s > 0 and self._held_downlink is None:
                 now = loop.time()
                 if turn_t0 is None:
                     turn_t0 = now
@@ -981,9 +1010,12 @@ class GeminiVoiceProxy:
             try:
                 if self._send_to_device is not None:
                     async with self._send_lock:
-                        await self._send_to_device(frame)
-                    if self._speak_text_active:
+                        sent = await self._send_downlink(frame)
+                    if sent and self._speak_text_active:
                         self._speak_text_frames += 1
+            except asyncio.CancelledError:
+                self._hold_frame_if_closed(frame)
+                raise
             except Exception as exc:
                 logger.warning("device send opus frame failed: %s", exc)
             finally:
@@ -1010,14 +1042,144 @@ class GeminiVoiceProxy:
             await self._frame_queue.put(frame)
         return True
 
+    def _device_socket_closed(self) -> bool:
+        """True when ``send_to_device`` is a closed websockets connection."""
+        send = self._send_to_device
+        ws = getattr(send, "__self__", None)
+        if ws is None:
+            return False
+        state_name = getattr(getattr(ws, "state", None), "name", "")
+        if state_name in {"CLOSING", "CLOSED"}:
+            return True
+        return getattr(ws, "close_code", None) is not None
+
+    def _ensure_hold(self, reason: str) -> None:
+        if self._held_downlink is not None:
+            return
+        self._held_downlink = []
+        logger.warning("%s; holding TTS for replay after reconnect", reason)
+
+    def _append_held(self, payload: str | bytes) -> None:
+        if self._held_downlink is None:
+            self._held_downlink = []
+        while len(self._held_downlink) >= _HELD_TTS_LIMIT:
+            dropped = False
+            for index, item in enumerate(self._held_downlink):
+                if isinstance(item, (bytes, bytearray)):
+                    del self._held_downlink[index]
+                    dropped = True
+                    break
+            if not dropped:
+                break
+        if len(self._held_downlink) < _HELD_TTS_LIMIT or not isinstance(payload, (bytes, bytearray)):
+            self._held_downlink.append(payload)
+
+    def _hold_frame_if_closed(self, frame: bytes) -> None:
+        if self._held_downlink is None and not self._device_socket_closed():
+            return
+        if self._held_downlink and self._held_downlink[-1] is frame:
+            return
+        self._ensure_hold("device downlink closed during send")
+        self._append_held(frame)
+
+    async def _send_downlink(self, payload: str | bytes) -> bool:
+        """Send one device payload, or keep it when the socket is already closed."""
+        if self._send_to_device is None:
+            return False
+        if self._held_downlink is not None:
+            self._append_held(payload)
+            return False
+        try:
+            await self._send_to_device(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not _is_closed_socket(exc):
+                raise
+            self._ensure_hold(f"TTS downlink closed ({_close_details(exc)})")
+            self._append_held(payload)
+            return False
+        return True
+
+    def _spill_queue_into_hold(self) -> None:
+        if self._held_downlink is None:
+            return
+        while True:
+            try:
+                frame = self._frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self._append_held(frame)
+            self._frame_queue.task_done()
+
+    def _spill_prebuffer_into_hold(self) -> None:
+        if self._held_downlink is None or not self._pcm_prebuffer or self._codec is None:
+            return
+        burst = bytes(self._pcm_prebuffer)
+        self._pcm_prebuffer.clear()
+        self._prebuffer_satisfied = True
+        try:
+            frames = self._codec.encode_pcm_24k(burst)
+        except Exception:
+            logger.debug("could not encode held prebuffer", exc_info=True)
+            return
+        for frame in frames:
+            self._append_held(frame)
+
+    def _capture_codec_tail(self) -> None:
+        """Keep a partial Opus frame when the device is already gone."""
+        if self._codec is None:
+            return
+        if self._held_downlink is None and not self._device_socket_closed():
+            return
+        try:
+            tail = self._codec.flush()
+        except Exception:
+            logger.debug("flush codec into TTS hold failed", exc_info=True)
+            return
+        if not tail:
+            return
+        self._ensure_hold("device downlink closed with unsent audio")
+        for frame in tail:
+            self._append_held(frame)
+
+    def _capture_unsent_audio(self) -> None:
+        """Move audio still in memory into the replay hold when the device is gone."""
+        pending = (not self._frame_queue.empty()) or bool(self._pcm_prebuffer)
+        if self._held_downlink is None and not (self._device_socket_closed() and pending):
+            return
+        if self._held_downlink is None:
+            code = getattr(getattr(self._send_to_device, "__self__", None), "close_code", None)
+            self._ensure_hold(f"device socket already closed code={code}")
+        self._spill_prebuffer_into_hold()
+        self._spill_queue_into_hold()
+
+    def take_undelivered_tts(self) -> list[str | bytes]:
+        """Return downlink audio the closed socket never accepted.
+
+        Empty when nothing was generated, so a clean disconnect does not
+        replay silence. The connection handler calls this after ``stop``.
+        """
+        self._capture_unsent_audio()
+        held = self._held_downlink
+        self._held_downlink = None
+        if not held:
+            return []
+        if not any(isinstance(item, (bytes, bytearray)) and item for item in held):
+            return []
+        return list(held)
+
     async def _begin_tts(self) -> bool:
         """Emit the start envelope just before the first Opus frame."""
         assert self._send_to_device is not None
+        start = json.dumps({"type": "tts", "state": "start"})
+        sentence = json.dumps({"type": "tts", "state": "sentence_start", "text": ""})
         try:
-            await self._send_to_device(json.dumps({"type": "tts", "state": "start"}))
-            await self._send_to_device(
-                json.dumps({"type": "tts", "state": "sentence_start", "text": ""})
-            )
+            started = await self._send_downlink(start)
+            if started or self._held_downlink is not None:
+                await self._send_downlink(sentence)
+            else:
+                return False
         except Exception as exc:
             logger.warning("tts.start envelope failed: %s", exc)
             return False
@@ -1299,13 +1461,14 @@ class GeminiVoiceProxy:
             if generation != self._tts_generation:
                 return
             try:
-                await self._send_to_device(  # type: ignore[misc]
-                    json.dumps({"type": "tts", "state": "stop"})
-                )
+                sent = await self._send_downlink(json.dumps({"type": "tts", "state": "stop"}))
+                if not sent and self._held_downlink is None:
+                    logger.warning("tts.stop envelope failed: downlink unavailable")
             except Exception as exc:
                 logger.warning("tts.stop envelope failed: %s", exc)
             self._tts_active = False
             self._status.on_tts_state(False)
+            self._capture_unsent_audio()
             self._prebuffer_satisfied = False
             self._pcm_prebuffer.clear()
             self._signal_speaking_avatar("idle")
@@ -1323,6 +1486,7 @@ class GeminiVoiceProxy:
         """
         self._tts_generation += 1
         was_active = self._tts_active
+        self._capture_codec_tail()
         if self._codec is not None:
             self._codec.reset_encode_buffer()
         await self._cancel_tts_tasks()
@@ -1334,14 +1498,13 @@ class GeminiVoiceProxy:
                 logger.exception("edge-tts abort failed")
         self._tts_active = False
         self._status.on_tts_state(False)
+        self._capture_unsent_audio()
         self._prebuffer_satisfied = False
         self._pcm_prebuffer.clear()
         if was_active and self._send_to_device is not None:
             try:
                 async with self._send_lock:
-                    await self._send_to_device(
-                        json.dumps({"type": "tts", "state": "stop"})
-                    )
+                    await self._send_downlink(json.dumps({"type": "tts", "state": "stop"}))
             except Exception as exc:
                 logger.debug("abort tts.stop drop: %s", exc)
             self._signal_speaking_leds(*self._post_tts_led_rgb())
