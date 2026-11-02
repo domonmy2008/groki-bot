@@ -160,9 +160,6 @@ class GeminiVoiceProxy:
     _ready_event: asyncio.Event = field(default_factory=asyncio.Event)
     _stopped: bool = False
     _reported_dead: bool = False
-    # After end_the_call / hangup, drop downlink audio until the next KWS OPEN
-    # so goodbye / "(Line dropped.)" TTS cannot keep a half-duplex mic deaf.
-    _suppress_tts_until_wake: bool = False
     # Firmware applies tts.start on its main task. A tiny guard delay keeps the
     # first binary Opus frame from racing in while the device is still Listening.
     device_tts_start_delay_s: float = field(
@@ -719,7 +716,6 @@ class GeminiVoiceProxy:
             if not await self._prepare_for_wake():
                 await self._abort_wake_open(bridge, gate)
                 return
-            self._suppress_tts_until_wake = False
             self._reported_dead = False
             await self._signal_manual_vad_start(bridge)
             await self._set_leds_safe(*LISTENING_LED_RGB)
@@ -762,29 +758,27 @@ class GeminiVoiceProxy:
     async def _handle_bridge_end_conversation(self) -> None:
         """Close the wake window when the model explicitly ends the conversation.
 
-        Abort in-flight TTS immediately so half-duplex devices (CoreS3) release
-        the speaker and mic/KWS can hear a re-wake phrase without waiting for
-        goodbye / post-call silence drain. Further downlink is suppressed until
-        the next KWS OPEN.
+        Leave in-flight goodbye TTS alone so it finishes via normal end_tts /
+        tts.stop. Post-hangup "(Line dropped.)" is avoided by skipping
+        response.create after end_the_call at the bridge tool layer. The wake
+        gate defers KWS reset while TTS is still active so half-duplex echo
+        does not pollute spotting for the next Hi Grok.
         """
-        try:
-            await self._abort_in_flight_tts()
-        except Exception:
-            logger.exception("end-conversation abort tts failed")
-        self._suppress_tts_until_wake = True
         gate = self._wake_gate
-        closed = False
-        if gate is not None:
-            closed = gate.close()
-            if closed:
-                self._status.on_wake_closed()
-                bridge = self._bridge
-                if bridge is not None:
-                    await self._signal_manual_vad_end(bridge)
-                if not self._tts_active:
-                    await self._set_leds_safe(0, 0, 0)
-                    await self._send_device_emotion_safe(IDLE_EMOTION)
-                await self._set_wake_motion(False)
+        if gate is None:
+            return
+        closed = gate.close()
+        if closed:
+            self._status.on_wake_closed()
+            bridge = self._bridge
+            if bridge is not None:
+                await self._signal_manual_vad_end(bridge)
+            # Do not race LEDs with in-flight goodbye; end_tts / abort paths
+            # extinguish via _post_tts_led_rgb once Speaking ends.
+            if not self._tts_active:
+                await self._set_leds_safe(0, 0, 0)
+                await self._send_device_emotion_safe(IDLE_EMOTION)
+            await self._set_wake_motion(False)
 
     async def try_handle_device_mcp(self, message: dict[str, Any]) -> bool:
         """Device MCP responses go back to the gateway, not to us.
@@ -983,8 +977,6 @@ class GeminiVoiceProxy:
         """
         if (self._stopped or self._send_to_device is None
                 or self._codec is None or not pcm_24khz):
-            return
-        if self._suppress_tts_until_wake:
             return
         now = asyncio.get_running_loop().time()
         if self._turn_rx_first is None:

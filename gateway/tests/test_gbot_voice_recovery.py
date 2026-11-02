@@ -499,8 +499,8 @@ async def test_wake_open_aborts_when_prepare_for_wake_fails(monkeypatch):
     assert bridge.sent == []
 
 @pytest.mark.asyncio
-async def test_end_the_call_aborts_tts_and_nudges_when_disconnected(monkeypatch):
-    """Hangup frees the speaker immediately and starts reconnect if needed."""
+async def test_end_the_call_keeps_goodbye_tts_and_nudges_when_disconnected(monkeypatch):
+    """Hangup leaves goodbye TTS playing and starts reconnect if needed."""
     from stackchan_mcp.wake_gate import WakeGate, WakeGateState
 
     class Spotter:
@@ -522,6 +522,7 @@ async def test_end_the_call_aborts_tts_and_nudges_when_disconnected(monkeypatch)
         debug_status=DebugStatus(),
     )
     proxy._wake_gate = gate
+    gate.is_tts_active = lambda: proxy._tts_active
     proxy._stopped = False
     proxy._tts_active = True
     proxy._health["state"] = "reconnecting"
@@ -535,8 +536,8 @@ async def test_end_the_call_aborts_tts_and_nudges_when_disconnected(monkeypatch)
     await proxy._handle_bridge_end_conversation()
 
     assert gate.state == WakeGateState.DORMANT
-    assert proxy._tts_active is False
-    assert proxy._suppress_tts_until_wake is True
+    assert proxy._tts_active is True
+    assert gate._kws_reset_pending is True
     assert nudged["value"] is True
 
 
@@ -563,7 +564,9 @@ async def test_end_the_call_keeps_healthy_session_without_nudge(monkeypatch):
         debug_status=DebugStatus(),
     )
     proxy._wake_gate = gate
+    gate.is_tts_active = lambda: proxy._tts_active
     proxy._stopped = False
+    proxy._tts_active = True
     monkeypatch.setattr(GbotVoiceProxy, "connected", property(lambda self: True))
     nudged = {"value": False}
     monkeypatch.setattr(
@@ -574,5 +577,5 @@ async def test_end_the_call_keeps_healthy_session_without_nudge(monkeypatch):
 
     assert gate.state == WakeGateState.DORMANT
     assert nudged["value"] is False
-    assert proxy._suppress_tts_until_wake is True
-
+    assert proxy._tts_active is True
+    assert gate._kws_reset_pending is True

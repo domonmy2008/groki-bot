@@ -186,11 +186,12 @@ class GbotVoiceProxy(GeminiVoiceProxy):
         return False
 
     async def _handle_bridge_end_conversation(self) -> None:
-        """Hang up: free the half-duplex speaker, keep DORMANT ready to re-wake.
+        """Hang up: let goodbye TTS finish; keep DORMANT ready to re-wake.
 
-        Base class aborts TTS and suppresses post-call downlink. Here we also
-        nudge the health supervisor when the voice socket is already down so
-        the next KWS OPEN does not sit in wake_reconnect_timeout_s.
+        Base class closes the wake gate without aborting in-flight goodbye.
+        Here we also nudge the health supervisor when the voice socket is
+        already down so the next KWS OPEN does not sit in
+        wake_reconnect_timeout_s.
         """
         await super()._handle_bridge_end_conversation()
         if self.connected:

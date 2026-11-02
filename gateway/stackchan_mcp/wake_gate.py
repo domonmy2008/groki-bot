@@ -229,6 +229,9 @@ class WakeGate:
     _listening_window_anchor: float | None = field(default=None, init=False)
     _kws_reset_due_since: float | None = field(default=None, init=False)
     _tts_stuck_latched: bool = field(default=False, init=False)
+    # CLOSE while goodbye TTS still plays: reset KWS once the mic is free.
+    _kws_reset_pending: bool = field(default=False, init=False)
+    _last_dormant_miss_log_at: float | None = field(default=None, init=False)
 
     @property
     def available(self) -> bool:
@@ -259,9 +262,15 @@ class WakeGate:
             closed = True
 
         if self.state == WakeGateState.DORMANT:
+            # CoreS3 is half-duplex: speaker echo / silence during Speaking
+            # must not enter the KWS stream or preroll, or the next Hi Grok
+            # after 退下 feels dull even seconds later.
+            if self._is_tts_active(now):
+                return WakeGateResult(closed=closed)
             self._append_preroll(pcm_16khz)
             self._maybe_reset_kws_in_dormant(pcm_16khz, now)
             if not self.kws.detect(pcm_16khz):
+                self._maybe_log_dormant_miss(pcm_16khz, now)
                 return WakeGateResult(closed=closed)
             self.state = WakeGateState.LISTENING
             self._last_voice_at = now
@@ -276,16 +285,28 @@ class WakeGate:
         return WakeGateResult(forward_pcm=(pcm_16khz,), closed=closed)
 
     def close(self) -> bool:
-        """Go back to DORMANT and drop the buffered conversation audio."""
+        """Go back to DORMANT and drop the buffered conversation audio.
+
+        If goodbye TTS is still playing, defer the KWS reset until the mic is
+        free so half-duplex echo cannot pollute a freshly reset stream.
+        """
         was_listening = self.is_listening
         self.state = WakeGateState.DORMANT
         self._last_voice_at = None
         self._opened_at = None
         self._listening_window_anchor = None
         self._clear_preroll()
-        if self.kws is not None:
-            self.kws.reset()
-            self._last_kws_reset_at = self.clock()
+        now = self.clock()
+        if self._is_tts_active(now):
+            self._kws_reset_pending = True
+            if was_listening:
+                logger.info(
+                    "wake gate CLOSE -> DORMANT (KWS reset deferred until TTS ends)"
+                )
+        else:
+            self._reset_kws_now(now, reason="close")
+            if was_listening:
+                logger.info("wake gate CLOSE -> DORMANT (KWS reset, spotting resumed)")
         return was_listening
 
     def reset(self) -> None:
@@ -330,6 +351,13 @@ class WakeGate:
             if not was_stuck:
                 # Normal end: treat now as new activity, so the user gets a full idle_s window to answer.
                 self._last_voice_at = now
+            if self._kws_reset_pending and self.state == WakeGateState.DORMANT:
+                self._clear_preroll()
+                self._reset_kws_now(now, reason="tts_ended")
+        elif self._kws_reset_pending and self.state == WakeGateState.DORMANT:
+            # CLOSE raced before _tts_active_since was tracked; still flush once.
+            self._clear_preroll()
+            self._reset_kws_now(now, reason="tts_ended")
 
     def _is_idle(self, now: float) -> bool:
         if self._last_voice_at is None or self.idle_s <= 0:
@@ -359,6 +387,27 @@ class WakeGate:
     def _clear_preroll(self) -> None:
         self._preroll.clear()
         self._preroll_bytes = 0
+
+    def _reset_kws_now(self, now: float, *, reason: str) -> None:
+        if self.kws is not None:
+            self.kws.reset()
+            self._last_kws_reset_at = now
+        self._kws_reset_pending = False
+        self._kws_reset_due_since = None
+        logger.info("wake gate KWS reset (%s)", reason)
+
+    def _maybe_log_dormant_miss(self, pcm: bytes, now: float) -> None:
+        """Lightweight debug: loud DORMANT frames that did not wake."""
+        if pcm_rms_int16(pcm) < self.activity_rms_threshold:
+            return
+        last = self._last_dormant_miss_log_at
+        if last is not None and now - last < 2.0:
+            return
+        self._last_dormant_miss_log_at = now
+        logger.info(
+            "KWS miss DORMANT high-RMS=%.1f (no wake hit)",
+            pcm_rms_int16(pcm),
+        )
 
     def _maybe_reset_kws_in_dormant(self, pcm: bytes, now: float) -> None:
         """Reset the KWS stream on a fixed period while DORMANT, so detection

@@ -259,7 +259,7 @@ def test_dormant_forces_reset_after_defer_cap_despite_loud_audio() -> None:
 def test_listening_does_not_close_while_tts_active() -> None:
     clock = FakeClock()
     kws = FakeKeywordSpotter([True, False])
-    tts_active = {"value": True}
+    tts_active = {"value": False}
     gate = WakeGate(
         kws=kws,
         idle_s=5.0,
@@ -270,6 +270,8 @@ def test_listening_does_not_close_while_tts_active() -> None:
     )
 
     gate.process(_pcm(1200))
+    assert gate.state == WakeGateState.LISTENING
+    tts_active["value"] = True
     clock.advance(20.0)
     still_open = gate.process(_pcm(50))
 
@@ -280,7 +282,7 @@ def test_listening_does_not_close_while_tts_active() -> None:
 def test_listening_idle_window_restarts_when_tts_ends_after_long_reply() -> None:
     clock = FakeClock()
     kws = FakeKeywordSpotter([True, False])
-    tts_active = {"value": True}
+    tts_active = {"value": False}
     gate = WakeGate(
         kws=kws,
         idle_s=30.0,
@@ -291,6 +293,8 @@ def test_listening_idle_window_restarts_when_tts_ends_after_long_reply() -> None
     )
 
     gate.process(_pcm(1200))
+    assert gate.state == WakeGateState.LISTENING
+    tts_active["value"] = True
     clock.advance(40.0)
     assert gate.process(_pcm(50)).closed is False
 
@@ -309,16 +313,20 @@ def test_listening_idle_window_restarts_when_tts_ends_after_long_reply() -> None
 def test_listening_closes_after_tts_stuck_timeout() -> None:
     clock = FakeClock()
     kws = FakeKeywordSpotter([True, False])
+    tts_active = {"value": False}
     gate = WakeGate(
         kws=kws,
         idle_s=5.0,
         max_listening_s=100.0,
         tts_stuck_max_s=10.0,
-        is_tts_active=lambda: True,
+        is_tts_active=lambda: tts_active["value"],
         clock=clock,
     )
 
     gate.process(_pcm(1200))
+    assert gate.state == WakeGateState.LISTENING
+    tts_active["value"] = True
+    gate.process(_pcm(50))  # arm TTS-active tracking before the stuck clock
     clock.advance(11.0)
     closed = gate.process(_pcm(50))
 
@@ -329,7 +337,7 @@ def test_listening_closes_after_tts_stuck_timeout() -> None:
 def test_max_listening_window_resets_after_tts_ends() -> None:
     clock = FakeClock()
     kws = FakeKeywordSpotter([True, False])
-    tts_active = {"value": True}
+    tts_active = {"value": False}
     gate = WakeGate(
         kws=kws,
         idle_s=100.0,
@@ -339,6 +347,8 @@ def test_max_listening_window_resets_after_tts_ends() -> None:
     )
 
     gate.process(_pcm(1200))
+    assert gate.state == WakeGateState.LISTENING
+    tts_active["value"] = True
     clock.advance(8.0)
     still_open = gate.process(_pcm(50))
     assert still_open.closed is False
@@ -406,6 +416,67 @@ def test_close_resets_state_and_keyword_spotter() -> None:
 
     assert gate.state == WakeGateState.DORMANT
     assert kws.reset_count == 1
+
+
+
+def test_dormant_skips_kws_detect_while_tts_active() -> None:
+    """Half-duplex echo during Speaking must not enter the KWS stream."""
+    kws = FakeKeywordSpotter([True])
+    tts_active = {"value": True}
+    gate = WakeGate(
+        kws=kws,
+        activity_rms_threshold=0.0,
+        is_tts_active=lambda: tts_active["value"],
+    )
+    loud = _pcm(12000)
+    result = gate.process(loud)
+    assert result.woke is False
+    assert gate.state == WakeGateState.DORMANT
+    assert kws.seen == []
+    assert kws.reset_count == 0
+
+    tts_active["value"] = False
+    result = gate.process(loud)
+    assert result.woke is True
+    assert kws.seen == [loud]
+
+
+def test_close_defers_kws_reset_until_tts_ends() -> None:
+    kws = FakeKeywordSpotter([False, True])
+    tts_active = {"value": True}
+    gate = WakeGate(
+        kws=kws,
+        activity_rms_threshold=0.0,
+        is_tts_active=lambda: tts_active["value"],
+    )
+    gate.state = WakeGateState.LISTENING
+    assert gate.close() is True
+    assert gate.state == WakeGateState.DORMANT
+    assert gate._kws_reset_pending is True
+    assert kws.reset_count == 0
+
+    # Still speaking: no detect, no reset.
+    gate.process(_pcm(8000))
+    assert kws.reset_count == 0
+    assert kws.seen == []
+
+    tts_active["value"] = False
+    result = gate.process(_pcm(100))
+    assert kws.reset_count == 1
+    assert gate._kws_reset_pending is False
+    # First post-TTS frame is detectable (scripted False then True).
+    assert result.woke is False
+    result = gate.process(_pcm(200))
+    assert result.woke is True
+
+
+def test_close_resets_kws_immediately_when_tts_inactive() -> None:
+    kws = FakeKeywordSpotter()
+    gate = WakeGate(kws=kws, is_tts_active=lambda: False)
+    gate.state = WakeGateState.LISTENING
+    assert gate.close() is True
+    assert kws.reset_count == 1
+    assert gate._kws_reset_pending is False
 
 
 def test_pcm_rms_int16_uses_sample_energy() -> None:
