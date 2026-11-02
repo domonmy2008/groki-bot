@@ -497,3 +497,82 @@ async def test_wake_open_aborts_when_prepare_for_wake_fails(monkeypatch):
     await proxy._forward_gated_device_pcm(b"\x00\x00" * 160)
     assert gate.state == WakeGateState.DORMANT
     assert bridge.sent == []
+
+@pytest.mark.asyncio
+async def test_end_the_call_aborts_tts_and_nudges_when_disconnected(monkeypatch):
+    """Hangup frees the speaker immediately and starts reconnect if needed."""
+    from stackchan_mcp.wake_gate import WakeGate, WakeGateState
+
+    class Spotter:
+        available = True
+
+        def detect(self, pcm):
+            return False
+
+        def reset(self):
+            return None
+
+    gate = WakeGate(kws=Spotter(), activity_rms_threshold=0.0)
+    gate.state = WakeGateState.LISTENING
+    proxy = GbotVoiceProxy(
+        wake_gate_factory=lambda: gate,
+        device_tts_start_delay_s=0,
+        device_frame_pace_ms=0,
+        device_prebuffer_ms=0,
+        debug_status=DebugStatus(),
+    )
+    proxy._wake_gate = gate
+    proxy._stopped = False
+    proxy._tts_active = True
+    proxy._health["state"] = "reconnecting"
+    proxy._health["last_error"] = "connection_lost"
+    monkeypatch.setattr(GbotVoiceProxy, "connected", property(lambda self: False))
+    nudged = {"value": False}
+    monkeypatch.setattr(
+        proxy, "_nudge_reconnect", lambda: nudged.__setitem__("value", True)
+    )
+
+    await proxy._handle_bridge_end_conversation()
+
+    assert gate.state == WakeGateState.DORMANT
+    assert proxy._tts_active is False
+    assert proxy._suppress_tts_until_wake is True
+    assert nudged["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_end_the_call_keeps_healthy_session_without_nudge(monkeypatch):
+    from stackchan_mcp.wake_gate import WakeGate, WakeGateState
+
+    class Spotter:
+        available = True
+
+        def detect(self, pcm):
+            return False
+
+        def reset(self):
+            return None
+
+    gate = WakeGate(kws=Spotter(), activity_rms_threshold=0.0)
+    gate.state = WakeGateState.LISTENING
+    proxy = GbotVoiceProxy(
+        wake_gate_factory=lambda: gate,
+        device_tts_start_delay_s=0,
+        device_frame_pace_ms=0,
+        device_prebuffer_ms=0,
+        debug_status=DebugStatus(),
+    )
+    proxy._wake_gate = gate
+    proxy._stopped = False
+    monkeypatch.setattr(GbotVoiceProxy, "connected", property(lambda self: True))
+    nudged = {"value": False}
+    monkeypatch.setattr(
+        proxy, "_nudge_reconnect", lambda: nudged.__setitem__("value", True)
+    )
+
+    await proxy._handle_bridge_end_conversation()
+
+    assert gate.state == WakeGateState.DORMANT
+    assert nudged["value"] is False
+    assert proxy._suppress_tts_until_wake is True
+

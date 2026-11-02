@@ -1069,7 +1069,16 @@ class GbotVoiceBridge:
                     },
                 }
             )
-            await self._request_response()
+            # Hangup must not solicit another spoken turn. CoreS3 is half-duplex;
+            # post-call "(Line dropped.)" TTS would deafen KWS for re-wake.
+            if name == "end_the_call":
+                self._cancel_idle()
+                self._pending_response = False
+                self._drop_until_response = True
+                if self._active_response:
+                    self._suppressed.add(self._active_response)
+            else:
+                await self._request_response()
         except Exception:
             logger.warning("Grok Bot voice tool response failed (details redacted)")
 

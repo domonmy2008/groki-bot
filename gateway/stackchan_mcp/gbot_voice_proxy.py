@@ -185,6 +185,27 @@ class GbotVoiceProxy(GeminiVoiceProxy):
         )
         return False
 
+    async def _handle_bridge_end_conversation(self) -> None:
+        """Hang up: free the half-duplex speaker, keep DORMANT ready to re-wake.
+
+        Base class aborts TTS and suppresses post-call downlink. Here we also
+        nudge the health supervisor when the voice socket is already down so
+        the next KWS OPEN does not sit in wake_reconnect_timeout_s.
+        """
+        await super()._handle_bridge_end_conversation()
+        if self.connected:
+            logger.info(
+                "end_the_call: DORMANT with healthy Grok voice; ready for instant re-wake"
+            )
+            return
+        self._nudge_reconnect()
+        logger.info(
+            "end_the_call: Grok voice unhealthy (state=%s error=%s); "
+            "supervisor nudged for re-wake",
+            self._health.get("state"),
+            self._health.get("last_error"),
+        )
+
     async def _handle_session_dead(self) -> None:
         """Voice WS ended. Close an active listen window; let supervisor recover.
 

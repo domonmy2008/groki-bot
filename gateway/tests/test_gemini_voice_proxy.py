@@ -932,13 +932,54 @@ async def test_bridge_end_conversation_closes_wake_gate_and_extinguishes_led(
     await proxy.start(info, {"type": "hello"}, send)
     await proxy.send_device_binary(b"wake")
     esp32.calls.clear()
+    proxy._tts_active = True
+    sent.clear()
 
     callback = proxy._bridge.kwargs["on_end_conversation"]
     await callback()
 
     assert gate.state == WakeGateState.DORMANT
+    assert proxy._tts_active is False
+    assert proxy._suppress_tts_until_wake is True
+    assert any(
+        isinstance(msg, str) and '"type": "tts"' in msg and '"state": "stop"' in msg
+        for msg in sent
+    )
     led_calls = [c for c in esp32.calls if c[0] == "self.led.set_all"]
     assert led_calls[-1][1] == {"r": 0, "g": 0, "b": 0}
+
+
+@pytest.mark.asyncio
+async def test_end_conversation_suppresses_post_hangup_tts_until_next_wake(
+    monkeypatch,
+    info,
+):
+    """Goodbye / Line-dropped audio after hangup must not restart device TTS."""
+    proxy, esp32, sent = _make_proxy(monkeypatch=monkeypatch)
+    gate = WakeGate(
+        kws=ScriptedKeywordSpotter([True, True]),
+        activity_rms_threshold=0.0,
+    )
+    proxy.wake_gate_factory = lambda: gate
+    proxy.wake_confirm_hold_s = 0
+
+    async def send(msg): sent.append(msg)
+
+    await proxy.start(info, {"type": "hello"}, send)
+    await proxy.send_device_binary(b"wake")
+    callback = proxy._bridge.kwargs["on_end_conversation"]
+    await callback()
+    assert proxy._suppress_tts_until_wake is True
+    sent.clear()
+
+    await proxy._handle_gemini_audio(b"\x00\x01" * 480)
+    assert proxy._tts_active is False
+    assert sent == []
+
+    # Next KWS OPEN clears the suppress latch.
+    await proxy.send_device_binary(b"wake-again")
+    assert gate.state == WakeGateState.LISTENING
+    assert proxy._suppress_tts_until_wake is False
 
 
 @pytest.mark.asyncio

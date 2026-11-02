@@ -655,3 +655,20 @@ async def test_unavailable_desktop_has_readable_chinese_without_diagnostic_code(
     assert b.metrics["tool_outcomes"][name + ":native_not_ready"] == 1
     assert "spoken" in b._provider_tool_instructions()
     await b.stop()
+
+@pytest.mark.asyncio
+async def test_end_the_call_acks_tool_without_requesting_spoken_response(monkeypatch):
+    """Hangup must not trigger a follow-up spoken turn (e.g. Line dropped)."""
+    b = make(monkeypatch)
+    b._on_end_conversation = AsyncMock()
+    b._configure_tools(
+        {"tools": [{"name": "end_the_call", "parameters": {"type": "object"}}]}
+    )
+    await b._tool({"name": "end_the_call", "call_id": "hangup", "arguments": "{}"})
+    b._on_end_conversation.assert_awaited_once()
+    types = [call.args[0].get("type") for call in b._send.call_args_list]
+    assert "conversation.item.create" in types
+    assert "response.create" not in types
+    assert b._drop_until_response is True
+    await b.stop()
+
