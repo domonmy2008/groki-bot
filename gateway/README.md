@@ -294,9 +294,9 @@ retries with a growing delay (up to 5 minutes).
 ### Start it
 
 Nothing extra: the gateway starts the tracker when it starts and restarts it
-if it exits. The head follows faces from the start. If the tracker has not
-been built, the gateway logs one line and runs normally without face
-tracking:
+if it exits. The head follows faces only after the wake word; until then it
+stays at home. If the tracker has not been built, the gateway logs one line
+and runs normally without face tracking:
 
 ```
 face tracker unavailable: executable not found at .../tools/vision-tracker/.build/release/groki-vision-tracker (build with: cd tools/vision-tracker && swift build -c release); the head will not follow faces
@@ -314,19 +314,22 @@ and start it with
    Under `face_tracking`: `tracker_running` is `true`, `face_reported` turns
    `true` and `last_face_at` keeps updating while the camera sees you,
    `head_follow` is `true` and `mode` is `idle`.
-3. Move left and right: the head turns toward you and keeps following, within
-   the robot's servo limits (by default ±40° left/right, -10° to +25° up/down).
-   When the camera loses your face, the head stops following and after about
-   two seconds the robot's own idle head motion takes over again.
+3. Say the wake word, then move left and right: the head turns toward you and
+   keeps following, within the robot's servo limits (by default ±40° left/right,
+   -10° to +25° up/down). Before the wake word, and again after the gate
+   closes, the head stays at home (yaw 0, pitch 45, clamped to those limits)
+   and does not look around on its own.
 
 ### While you talk
 
-Following pauses by design during a conversation: the gateway sends no head
-moves while the robot speaks (`mode` is `working`) or while it listens after
-the wake word (`mode` is `quiet`), so servo noise and motion do not get in
-the way of the conversation. It follows again with the next detection once
-the conversation is over. The firmware also holds a head command that arrives
-while the robot is speaking and applies it when the reply ends.
+Face chase runs only while the wake gate is open (`mode` is `quiet` after
+"Hi Grok"). It pauses while the robot speaks (`mode` is `working`). When the
+gate returns to DORMANT (idle timeout, or 退下 / end of call) the gateway
+sends the head home and holds it there. With the wake word disabled
+(passthrough) autonomous chase and idle look-around stay off; a head command
+from the current spoken turn can still move it. The firmware also holds a
+head command that arrives while the robot is speaking and applies it when
+the reply ends.
 
 ### Turn head follow on and off
 

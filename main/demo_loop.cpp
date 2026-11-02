@@ -57,15 +57,20 @@ constexpr const char* kTag = "stackchan";
 
     using namespace stackchan;
 
-    // Random head pose targets, redrawn every kPoseMinMs..kPoseMaxMs. The
-    // ranges come from the per-device ServoLimits so the demo respects the
-    // configured motion (servo_task also clamps defensively).
+    // Servo limits for petting and, only when autonomous_idle is set, the
+    // optional random poses (every kPoseMinMs..kPoseMaxMs). servo_task also
+    // clamps defensively. The default path homes once and then stays still.
     const float kYawMinDeg = static_cast<float>(limits.yaw_min_deg);
     const float kYawMaxDeg = static_cast<float>(limits.yaw_max_deg);
     const float kPitchMinDeg = static_cast<float>(limits.pitch_min_deg);
     const float kPitchMaxDeg = static_cast<float>(limits.pitch_max_deg);
     constexpr std::uint32_t kPoseMinMs = 4000;
     constexpr std::uint32_t kPoseMaxMs = 8000;
+    // Protocol resting pose. Pitch 45° matches the gateway WS home command;
+    // clamp_deg keeps it inside this board's servo limits (often tighter).
+    constexpr float kRestYawDeg = 0.0f;
+    constexpr float kRestPitchDeg = 45.0f;
+    constexpr std::uint16_t kRestSpeed = 180;
     constexpr std::uint32_t kSpeechMinMs = 6000;
     constexpr std::uint32_t kSpeechMaxMs = 12000;
 
@@ -82,6 +87,9 @@ constexpr const char* kTag = "stackchan";
     };
 
     std::uint32_t next_pose_ms = 0;
+    // One-shot home when autonomous idle is off. After this, targets are left
+    // alone so gateway WS head commands are not pulled back to rest.
+    bool resting_home_sent = false;
     std::uint32_t next_speech_ms = 2000; // first babble shortly after boot
 
     // Base-board battery monitor (INA226 on the internal I2C bus). Read here —
@@ -377,11 +385,13 @@ constexpr const char* kTag = "stackchan";
             continue;
         }
 
-        // Idle behaviours (random head poses, nadenade) run when there is no
-        // conversation OR the conversation is idly listening. The full demo
-        // (mouth-sync, Wi-Fi balloon, babble, expression cycle) runs only when
-        // there is no conversation at all — otherwise it would fight the
-        // conversation task for the avatar and the I2S bus.
+        // Nadenade and the resting-home pose run when there is no conversation
+        // OR the conversation is idly listening. Random look-around is off
+        // unless servo.autonomous_idle is set; wake-time motion comes from
+        // the gateway. The full demo (mouth-sync, Wi-Fi balloon, babble,
+        // expression cycle) runs only when there is no conversation at all —
+        // otherwise it would fight the conversation task for the avatar and
+        // the I2S bus.
         const bool allow_idle_demo = !conv_active || conv_idle;
         const bool allow_full_demo = !conv_active;
 
@@ -591,19 +601,42 @@ constexpr const char* kTag = "stackchan";
             g_state->servo.target_pitch_deg.store(head_pet_prev_pitch, std::memory_order_relaxed);
         }
 
-        // Idle head poses: the head moves on its own when nobody interacts with it.
-        if (!external_servo_control && !head_pet_touch_active && !head_pet_restore_pending &&
-            !g_state->servo.masked.load(std::memory_order_relaxed) &&
-            static_cast<std::int32_t>(now_ms - g_state->servo.head_hold_until_ms.load(std::memory_order_relaxed)) >= 0 &&
-            now_ms >= next_pose_ms) {
-            const auto pose = groki_motion::idle_pose(
-                g_state->servo.target_yaw_deg.load(std::memory_order_relaxed),
-                g_state->servo.target_pitch_deg.load(std::memory_order_relaxed),
-                motion_limits, esp_random());
-            g_state->servo.speed_override.store(pose.speed, std::memory_order_relaxed);
-            g_state->servo.target_yaw_deg.store(pose.yaw_deg, std::memory_order_relaxed);
-            g_state->servo.target_pitch_deg.store(pose.pitch_deg, std::memory_order_relaxed);
-            next_pose_ms = now_ms + rand_range_ms(kPoseMinMs, kPoseMaxMs);
+        // Wake-time idle / look-around is owned by the gateway via WS
+        // ``{"type":"head","yaw":..,"pitch":..,"speed":..}`` while the wake
+        // gate is LISTENING. This task cannot see DORMANT vs LISTENING.
+        // With autonomous_idle left false, command the protocol home pose
+        // once (yaw 0, pitch 45, clamped), then leave the targets alone.
+        // A head_hold still in the future means the gateway already owns
+        // the head and will send home itself when the gate closes.
+        const bool servo_available = !external_servo_control && !head_pet_touch_active &&
+                                     !head_pet_restore_pending &&
+                                     !g_state->servo.masked.load(std::memory_order_relaxed);
+        const bool head_held = static_cast<std::int32_t>(
+                                   now_ms - g_state->servo.head_hold_until_ms.load(std::memory_order_relaxed)) < 0;
+        if (servo_available && head_held) {
+            resting_home_sent = true;
+        } else if (servo_available && g_state->servo.autonomous_idle.load(std::memory_order_relaxed)) {
+            if (now_ms >= next_pose_ms) {
+                const auto pose = groki_motion::idle_pose(
+                    g_state->servo.target_yaw_deg.load(std::memory_order_relaxed),
+                    g_state->servo.target_pitch_deg.load(std::memory_order_relaxed),
+                    motion_limits, esp_random());
+                g_state->servo.speed_override.store(pose.speed, std::memory_order_relaxed);
+                g_state->servo.target_yaw_deg.store(pose.yaw_deg, std::memory_order_relaxed);
+                g_state->servo.target_pitch_deg.store(pose.pitch_deg, std::memory_order_relaxed);
+                next_pose_ms = now_ms + rand_range_ms(kPoseMinMs, kPoseMaxMs);
+            }
+        } else if (servo_available && !resting_home_sent) {
+            const float home_yaw = clamp_deg(kRestYawDeg, limits.yaw_min_deg, limits.yaw_max_deg);
+            const float home_pitch = clamp_deg(kRestPitchDeg, limits.pitch_min_deg, limits.pitch_max_deg);
+            const float yaw = g_state->servo.target_yaw_deg.load(std::memory_order_relaxed);
+            const float pitch = g_state->servo.target_pitch_deg.load(std::memory_order_relaxed);
+            if (std::fabs(yaw - home_yaw) > 0.5f || std::fabs(pitch - home_pitch) > 0.5f) {
+                g_state->servo.speed_override.store(kRestSpeed, std::memory_order_relaxed);
+                g_state->servo.target_yaw_deg.store(home_yaw, std::memory_order_relaxed);
+                g_state->servo.target_pitch_deg.store(home_pitch, std::memory_order_relaxed);
+            }
+            resting_home_sent = true;
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));

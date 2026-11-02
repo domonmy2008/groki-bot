@@ -48,6 +48,7 @@ class TrackingBridge:
         on_head_command: Callable[[], None] | None = None,
         is_tts_active: Callable[[], bool] | None = None,
         is_listening: Callable[[], bool] | None = None,
+        wake_motion_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self.esp32 = esp32
         self.config = config or TrackingConfig()
@@ -55,6 +56,11 @@ class TrackingBridge:
         self._mode = "idle"
         self._is_tts_active = is_tts_active
         self._is_listening = is_listening
+        # When set, face chase runs only while this returns true (LISTENING).
+        # DORMANT and passthrough (no gate) should return false so the head
+        # stays home. None keeps the historical "follow unless quiet" rule
+        # for unit tests that do not install a wake policy.
+        self._wake_motion_allowed = wake_motion_allowed
         neutral = float(self.config.neutral_pitch)
         self._yaw = self._output_yaw = self._segment_start_yaw = self._segment_end_yaw = self._cached_yaw = 0.0
         self._pitch = self._output_pitch = self._segment_start_pitch = self._segment_end_pitch = self._cached_pitch = neutral
@@ -99,6 +105,29 @@ class TrackingBridge:
         if not self._has_seen_face:
             return None
         return round(self._cached_yaw), round(self._cached_pitch)
+
+    def _wake_follow_allowed(self) -> bool:
+        """True when autonomous face chase may send a head command.
+
+        A wake policy (gateway) allows chase only inside an open wake window.
+        Without a policy, chase is allowed except in the legacy quiet mode.
+        """
+        policy = self._wake_motion_allowed
+        if policy is None:
+            return self.mode != "quiet"
+        try:
+            return bool(policy())
+        except Exception:
+            logger.debug("wake motion policy failed; holding the head still", exc_info=True)
+            return False
+
+    def _follow_blocked(self) -> bool:
+        """Speaking, a closed wake gate, or no device: do not chase."""
+        if not self.enabled or not self._device_reachable():
+            return True
+        if self.mode == "working":
+            return True
+        return not self._wake_follow_allowed()
 
     def _device_reachable(self) -> bool:
         usb = self.usb_transport
@@ -174,7 +203,7 @@ class TrackingBridge:
             return False
         if self._on_face_detected is not None:
             self._on_face_detected()
-        if not self.enabled or self.mode in {"working", "quiet"} or not self._device_reachable():
+        if self._follow_blocked():
             return False
         x = float(detection.get("x", 0.5))
         y = float(detection.get("y", 0.5))
@@ -252,11 +281,9 @@ class TrackingBridge:
         if now is None:
             now = asyncio.get_running_loop().time()
         if (
-            self.mode in {"working", "quiet"}
-            or not self.enabled
+            self._follow_blocked()
             or self._last_target_update_s is None
             or now - self._last_target_update_s > self.STALE_TARGET_S
-            or not self._device_reachable()
         ):
             return False
         yaw, pitch = self._interpolated_pose(now)

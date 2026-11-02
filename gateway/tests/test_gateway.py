@@ -211,13 +211,50 @@ async def test_gateway_voice_signal_arbitrates_tracking(monkeypatch):
     proxy._wake_gate = gate
     gw.esp32._connection = SimpleNamespace(cloud_proxy=proxy)
     assert gw.tracking_bridge.mode == "idle"
+    assert gw._wake_head_motion_allowed() is False
     gate.state = WakeGateState.LISTENING
     assert gw.tracking_bridge.mode == "quiet"
+    assert gw._wake_head_motion_allowed() is True
     proxy._status.on_tts_state(True)
     assert gw.tracking_bridge.mode == "working"
     proxy._status.on_tts_state(False)
     gate.state = WakeGateState.DORMANT
     assert gw.tracking_bridge.mode == "idle"
+    assert gw._wake_head_motion_allowed() is False
+    proxy._wake_gate_passthrough = True
+    gate.state = WakeGateState.LISTENING
+    assert gw._wake_head_motion_allowed() is False
+
+
+@pytest.mark.asyncio
+async def test_gbot_wake_hook_homes_on_dormant(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_USB_DISABLE", "1")
+    monkeypatch.setenv("STACKCHAN_VOICE_BACKEND", "gbot")
+    gw = Gateway()
+    proxy = gw._make_voice_proxy()
+    assert proxy.on_wake_motion == gw._on_wake_motion
+
+    class Dev:
+        device_connected = True
+        mcp_supported = False
+
+        def __init__(self):
+            self.head: list[tuple[int, int, int]] = []
+
+        async def send_head(self, yaw, pitch, speed, **kwargs):
+            self.head.append((int(yaw), int(pitch), int(speed)))
+            return {"ok": True}, None
+
+    dev = Dev()
+    gw.idle_behavior.esp32 = dev
+    await proxy.on_wake_motion(False)
+    assert dev.head == [(0, 45, gw.idle_behavior.HOME_SPEED)]
+    await proxy.on_wake_motion(True)
+    assert gw.idle_behavior.wake_active is True
+    assert len(dev.head) == 1
+    await proxy.on_wake_motion(False)
+    assert gw.idle_behavior.wake_active is False
+    assert dev.head[-1][:2] == (0, 45)
 
 
 @pytest.mark.asyncio
@@ -249,12 +286,10 @@ async def test_xiaozhi_speech_pauses_detection_until_cloud_tts_stops(monkeypatch
     assert calls == []
     await cloud._handle_cloud_json(json.dumps({"type": "tts", "state": "stop"}))
     assert gw.tracking_bridge.mode == "idle"
-    try:
-        assert await gw.tracking_bridge.handle_detection(detection) is True
-        await asyncio.sleep(0.03)
-        assert calls
-    finally:
-        await gw.tracking_bridge.stop()
+    # No wake gate on the xiaozhi proxy: autonomous chase stays off.
+    assert await gw.tracking_bridge.handle_detection(detection) is False
+    assert calls == []
+    await gw.tracking_bridge.stop()
 
 
 @pytest.mark.asyncio
@@ -290,13 +325,11 @@ async def test_local_say_state_pauses_detection_until_tts_stop(monkeypatch):
     assert calls == []
     await gw.esp32.send_tts_state("stop")
     assert gw.tracking_bridge.mode == "idle"
-    try:
-        assert await gw.tracking_bridge.handle_detection(detection) is True
-        await asyncio.sleep(0.03)
-        assert calls
-        assert sent == ["start", "stop"]
-    finally:
-        await gw.tracking_bridge.stop()
+    # No voice proxy, so there is no LISTENING window to chase in.
+    assert await gw.tracking_bridge.handle_detection(detection) is False
+    assert calls == []
+    assert sent == ["start", "stop"]
+    await gw.tracking_bridge.stop()
 
 
 # --- face tracking: tracker process and head-follow switch -------------------
@@ -548,6 +581,19 @@ def _connect_head_recorder(gw) -> list[dict]:
     return head_calls
 
 
+def _open_listening_gate(gw, device=None):
+    """Attach a LISTENING wake gate so autonomous face chase is allowed."""
+    from types import SimpleNamespace
+    from stackchan_mcp.wake_gate import WakeGate, WakeGateState
+
+    gate = WakeGate(kws=None)
+    gate.state = WakeGateState.LISTENING
+    proxy = SimpleNamespace(_wake_gate=gate, _wake_gate_passthrough=False)
+    target = device if device is not None else gw.esp32._connection
+    target.cloud_proxy = proxy
+    return gate
+
+
 class _JsonRequest:
     def __init__(self, payload):
         self._payload = payload
@@ -570,6 +616,11 @@ async def test_head_follows_face_right_after_start_without_any_tool(fake_tracker
     await gw.start()
     try:
         head_calls = _connect_head_recorder(gw)
+        await _send_face(gw, 0.9)
+        await asyncio.sleep(0.05)
+        assert head_calls == []  # DORMANT / no gate: stay still
+
+        _open_listening_gate(gw)
         await _send_face(gw, 0.9)
         await _until(lambda: head_calls)
     finally:
@@ -601,8 +652,10 @@ async def test_voice_only_device_follows_face_through_ws_head_message(fake_track
             mcp_calls.append(name)
             return None, {"code": -32000, "message": "ESP32 MCP unsupported (features.mcp=false)"}
 
-        gw.esp32._connection = VoiceOnlyDevice()
+        device = VoiceOnlyDevice()
+        gw.esp32._connection = device
         gw.esp32.call_tool = call_tool
+        _open_listening_gate(gw, device)
         await _send_face(gw, 0.9)
         # The head turns toward the face on the right (positive yaw).
         await _until(lambda: any(yaw > 0 for yaw, _pitch, _speed in sent))
@@ -634,6 +687,11 @@ async def test_stop_looking_halts_head_but_keeps_face_time_and_look_at_me_resume
 
         await gw._handle_external_local_tool("set_face_tracking", {"enabled": True})
         await _send_face(gw, 0.9)
+        await asyncio.sleep(0.05)
+        assert head_calls == []  # follow on, but the wake gate is still closed
+
+        _open_listening_gate(gw)
+        await _send_face(gw, 0.9)
         await _until(lambda: head_calls)
     finally:
         await gw.stop()
@@ -657,6 +715,11 @@ async def test_head_follow_default_off_env_keeps_head_still_until_look_at_me(
         assert head_calls == []
 
         await gw._handle_external_local_tool("set_face_tracking", {"enabled": True})
+        await _send_face(gw, 0.9)
+        await asyncio.sleep(0.05)
+        assert head_calls == []
+
+        _open_listening_gate(gw)
         await _send_face(gw, 0.9)
         await _until(lambda: head_calls)
     finally:

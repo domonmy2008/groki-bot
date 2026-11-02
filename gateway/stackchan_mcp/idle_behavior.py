@@ -15,12 +15,23 @@ logger = logging.getLogger(__name__)
 
 
 class IdleBehavior:
-    """Move the robot subtly while it is idle.
+    """Move the robot subtly while the wake gate is LISTENING.
 
     The hook-side idle worker can run in a different process, so the gateway owns
     this behavior and exposes a small activity hook that pauses motion after MCP,
     hook, touch, and speak commands.
+
+    Random steps run only after ``set_wake_active(True)`` (the voice proxy sets
+    that while LISTENING). Dropping back to DORMANT sends the protocol home pose
+    once (yaw 0, pitch 45) and then holds still. ``STACKCHAN_GATEWAY_IDLE_ENABLED``
+    still defaults off; the wake flag only matters when the worker is enabled.
+    Home on DORMANT is sent either way, including voice-only firmware that
+    rejects MCP ``set_head_angles``.
     """
+
+    HOME_YAW = 0
+    HOME_PITCH = 45
+    HOME_SPEED = 180
 
     def __init__(
         self,
@@ -36,9 +47,10 @@ class IdleBehavior:
         self.min_interval_s = min_interval_s if min_interval_s is not None else float(os.getenv("STACKCHAN_IDLE_MIN_S", "4"))
         self.max_interval_s = max_interval_s if max_interval_s is not None else float(os.getenv("STACKCHAN_IDLE_MAX_S", "8"))
         self.pause_seconds = pause_seconds if pause_seconds is not None else float(os.getenv("STACKCHAN_IDLE_PAUSE_S", "3"))
-        # Default 0: the firmware's IdleMotionModifier (ported from M5's official one) owns idle motion.
-        # The gateway-side idle is kept as a fallback / debug aid and is off by default, so two sources
-        # never send set_head_angles and fight over the spring animation. Set STACKCHAN_GATEWAY_IDLE_ENABLED=1 to use it.
+        # Default 0. Firmware autonomous idle is also off by default, so the
+        # head stays at home until a wake window opens. Set
+        # STACKCHAN_GATEWAY_IDLE_ENABLED=1 to let this worker step while
+        # set_wake_active(True). The two sources must not both invent poses.
         self.enabled = os.getenv("STACKCHAN_GATEWAY_IDLE_ENABLED", "0").lower() not in {"0", "false", "no", "off"}
         self._rng = rng or random.Random()
         self._task: asyncio.Task[None] | None = None
@@ -47,8 +59,51 @@ class IdleBehavior:
         # through USB at ~10 ms instead of ~240 ms over WS.
         self.usb_transport = usb_transport
         self._defer_until = 0.0
-        self._last_yaw = 0.0
-        self._last_pitch = 15.0
+        self._last_yaw = float(self.HOME_YAW)
+        self._last_pitch = float(self.HOME_PITCH)
+        # False until the voice proxy reports LISTENING. Steps stay suppressed.
+        self._wake_active = False
+        self._dormant_home_sent = False
+
+    @property
+    def wake_active(self) -> bool:
+        return self._wake_active
+
+    async def set_wake_active(self, active: bool) -> None:
+        """Allow idle steps only while the wake gate is open.
+
+        Transition to inactive (and the initial DORMANT call) sends home once.
+        A later inactive call does not repeat it. If the device is unreachable
+        the home is left pending so the next call can retry.
+        """
+        active = bool(active)
+        if active:
+            self._wake_active = True
+            self._dormant_home_sent = False
+            return
+        was_active = self._wake_active
+        self._wake_active = False
+        if was_active or not self._dormant_home_sent:
+            await self._send_dormant_home()
+
+    async def _send_dormant_home(self) -> None:
+        if not self._device_reachable():
+            self._dormant_home_sent = False
+            return
+        args = {
+            "yaw": self.HOME_YAW,
+            "pitch": self.HOME_PITCH,
+            "speed": self.HOME_SPEED,
+        }
+        try:
+            await self._send_head_angles(args)
+        except Exception:
+            logger.exception("dormant home head command failed")
+            self._dormant_home_sent = False
+            return
+        self._dormant_home_sent = True
+        self._last_yaw = float(self.HOME_YAW)
+        self._last_pitch = float(self.HOME_PITCH)
 
     @property
     def running(self) -> bool:
@@ -106,8 +161,12 @@ class IdleBehavior:
         return getattr(self.esp32, "device_connected", False)
 
     async def step_once(self) -> bool:
-        """Run one official-like idle step. Returns True when a command was sent."""
-        if self._is_paused() or not self._device_reachable():
+        """Run one official-like idle step. Returns True when a command was sent.
+
+        Suppressed unless the wake gate is LISTENING (``set_wake_active(True)``).
+        DORMANT does not invent a new pose here; home is sent on that transition.
+        """
+        if not self._wake_active or self._is_paused() or not self._device_reachable():
             return False
         if await self._head_is_moving():
             # Official IdleMotionModifier delays 500 ms instead of cutting off
@@ -240,8 +299,16 @@ class IdleBehavior:
                 return None
         return None
 
+    def _esp32_voice_only(self) -> bool:
+        return getattr(self.esp32, "mcp_supported", True) is False
+
     async def _send_head_angles(self, args: dict[str, Any]) -> None:
-        """USB-first head write, fallback to WS esp32.call_tool."""
+        """USB-first head write.
+
+        Voice-only firmware (``features.mcp=false``) rejects MCP
+        ``set_head_angles``. Fall back to the WS ``head`` message, the same
+        path TrackingBridge uses.
+        """
         args = {key: value for key, value in args.items() if not key.startswith("_")}
         usb = self.usb_transport
         if usb is not None and getattr(usb, "connected", False):
@@ -257,4 +324,29 @@ class IdleBehavior:
                     "idle USB set_head_angles failed (%s); falling back to WS",
                     exc,
                 )
-        await self.esp32.call_tool("self.robot.set_head_angles", args)
+        await self._call_esp32_head(args)
+
+    async def _call_esp32_head(self, args: dict[str, Any]) -> None:
+        send_head = getattr(self.esp32, "send_head", None)
+        if callable(send_head) and self._esp32_voice_only():
+            result = await send_head(
+                args["yaw"],
+                args["pitch"],
+                args["speed"],
+                notify_activity=False,
+                notify_head_command=False,
+            )
+            error = result[1] if isinstance(result, tuple) and len(result) == 2 else None
+            if error:
+                message = error.get("message", error) if isinstance(error, dict) else error
+                logger.debug("idle WS head send failed: %s", message)
+            return
+        try:
+            await self.esp32.call_tool(
+                "self.robot.set_head_angles",
+                args,
+                notify_activity=False,
+            )
+        except TypeError:
+            # Unit fakes and older surfaces only accept (name, arguments).
+            await self.esp32.call_tool("self.robot.set_head_angles", args)

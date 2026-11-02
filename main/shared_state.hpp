@@ -110,9 +110,15 @@ public:
         // Non-zero overrides the servo task's default Goal Speed for the next
         // write_goal_position. Used for snappy gestures (head shake).
         std::atomic<std::uint16_t> speed_override{0};
-        // Keeps the autonomous idle poses from replacing a gateway head
-        // command right away (esp_timer milliseconds).
+        // Keeps demo_loop from replacing a gateway head command right away
+        // (esp_timer milliseconds). A hold still in the future means the
+        // gateway owns the head.
         std::atomic<std::uint32_t> head_hold_until_ms{0};
+        // On-device random idle look-around. Default false: wake-time head
+        // motion is owned by the gateway via WS ``head`` messages, and
+        // demo_loop only eases to the resting pose once. A future path may
+        // set this to restore firmware idle poses.
+        std::atomic<bool> autonomous_idle{false};
         // Servo torque enable. The on-device 操作 (control) screen toggles
         // this; the servo task enables/disables torque to match (false =
         // head goes limp).
@@ -147,9 +153,9 @@ public:
         // True while a conversation session is live.
         std::atomic<bool> active{false};
         // True while the conversation is idly listening (not thinking /
-        // speaking). demo_loop runs its idle behaviours (random head poses,
-        // nadenade) when this is set, but keeps babble / expression-cycle /
-        // mouth-sync to itself.
+        // speaking). demo_loop still runs nadenade then, but random head
+        // poses stay off unless servo.autonomous_idle is set. Babble /
+        // expression-cycle / mouth-sync stay off while a conversation exists.
         std::atomic<bool> idle{false};
         // Connection status + a count of transport-error reconnects
         // (recover_after_error). The 会話 screen shows both so a reconnect

@@ -222,7 +222,7 @@ tools/vision-tracker/.build/release/groki-vision-tracker
 
 ### 启动
 
-不需要额外操作：网关启动时自动拉起追踪程序，程序退出了会自动重启。网关一启动，头就开始跟随人脸。追踪程序还没编译时，网关只记一行日志，其余功能照常运行：
+不需要额外操作：网关启动时自动拉起追踪程序，程序退出了会自动重启。头只在唤醒之后跟随人脸；没唤醒时停在原点。追踪程序还没编译时，网关只记一行日志，其余功能照常运行：
 
 ```
 face tracker unavailable: executable not found at .../tools/vision-tracker/.build/release/groki-vision-tracker (build with: cd tools/vision-tracker && swift build -c release); the head will not follow faces
@@ -234,11 +234,11 @@ face tracker unavailable: executable not found at .../tools/vision-tracker/.buil
 
 1. 网关日志出现 `face tracker started pid=<进程号> endpoint=http://127.0.0.1:8766/track`，追踪程序输出 `Vision tracker camera: <摄像头名>`。
 2. 坐到摄像头前，打开 <http://127.0.0.1:8766/debug/status>，看 `face_tracking` 一节：`tracker_running` 是 `true`；摄像头看到你时 `face_reported` 变成 `true`，`last_face_at` 不断更新；`head_follow` 是 `true`，`mode` 是 `idle`。
-3. 左右移动：头会转向你并持续跟随，角度在舵机限位之内（默认左右 ±40°，上下 -10° 到 +25°）。摄像头看不到你的脸时，头停止跟随，大约两秒后机器人恢复自己的空闲动作。
+3. 先说唤醒词，再左右移动：头会转向你并持续跟随，角度在舵机限位之内（默认左右 ±40°，上下 -10° 到 +25°）。没唤醒时，以及门关上之后，头停在原点（yaw 0、pitch 45，再按舵机限位夹紧），不会自己东张西望。
 
-### 对话时暂停跟随
+### 只有唤醒态才动
 
-对话期间按设计暂停跟随：机器人说话时（`mode` 为 `working`）和唤醒后听你说话时（`mode` 为 `quiet`），网关不发转头指令，免得舵机的声音和动作干扰对话。对话结束后，下一次检测到人脸就恢复跟随。机器人说话时收到的转头指令，固件也会先存着，等这段回复说完再执行。
+人脸跟随只在唤醒门开着的时候跑（说完「Hi Grok」后 `mode` 为 `quiet`）。机器人说话时（`mode` 为 `working`）暂停跟随。门回到休眠（超时，或「退下」/结束通话）后，网关把头发回原点并保持不动。关掉唤醒词（直通）时，自动跟随和空闲张望都保持关闭；当前这句话里主动发来的转头指令仍然可以动。机器人说话时收到的转头指令，固件也会先存着，等这段回复说完再执行。
 
 ### 打开和关闭转头跟随
 
