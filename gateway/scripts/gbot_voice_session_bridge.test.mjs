@@ -202,3 +202,90 @@ test('HTTP: typed EOF or error reconnects independently and box results still ar
     } finally {await reader?.cancel();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
   }
 });
+
+function fakeSandboxPods(handlers) {
+  let ensures = 0; const hits = [];
+  const rpc = async method => {
+    assert.equal(method, 'EnsureSandBox');
+    ensures++;
+    return {gatewayUrl: `https://pod${ensures}.cursorvm.com`, gatewayToken: 'FAKE_TOKEN'};
+  };
+  const fetcher = async (url, options) => {
+    const {hostname, pathname} = new URL(url);
+    hits.push(hostname.split('.')[0] + pathname);
+    return handlers(hostname.split('.')[0], pathname, options);
+  };
+  return {rpc, fetcher, hits, get ensures() { return ensures; }};
+}
+const fakeResponse = (status, type = 'application/json') => ({ok: status >= 200 && status < 300, status, headers: new Headers({'content-type': type}), body: {cancel: async () => {}}});
+
+test('stale cached sandbox connection reconnects once and presence/probe recover without restart', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  let pod1Alive = true;
+  const pods = fakeSandboxPods((pod, path) => {
+    if (pod === 'pod1' && !pod1Alive) return fakeResponse(502);
+    return fakeResponse(200, path === '/events' ? 'text/event-stream' : 'application/json');
+  });
+  const client = new NativeSandboxClient({accountLoader: () => ({authId: 'owner'}), rpc: pods.rpc, fetcher: pods.fetcher, connectMode: 'normal'});
+  const presence = {agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false};
+  await client.presence(presence); await client.presence(presence);
+  assert.equal((await client.probe()).ok, true);
+  assert.equal(pods.ensures, 1, 'successful responses must keep the cached connection');
+  pod1Alive = false;
+  await client.presence(presence);
+  assert.equal(pods.ensures, 2);
+  assert.deepEqual(pods.hits.slice(-2), ['pod1/api/setVoiceCallPresence', 'pod2/api/setVoiceCallPresence']);
+  assert.equal((await client.probe()).ok, true);
+  assert.equal(pods.ensures, 2);
+});
+
+test('sandbox network errors and non-SSE event responses also reconnect', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  const pods = fakeSandboxPods((pod, path) => {
+    if (pod === 'pod1' && path === '/health') throw new TypeError('fetch failed');
+    if (pod === 'pod2' && path === '/events') return fakeResponse(200, 'text/html');
+    return fakeResponse(200, path === '/events' ? 'text/event-stream' : 'application/json');
+  });
+  const client = new NativeSandboxClient({accountLoader: () => ({authId: 'owner'}), rpc: pods.rpc, fetcher: pods.fetcher});
+  assert.equal((await client.probe()).ok, true);
+  assert.equal(pods.ensures, 3);
+  assert.deepEqual(pods.hits, ['pod1/health', 'pod2/health', 'pod2/events', 'pod3/events']);
+});
+
+test('sandbox reconnect is bounded and request errors do not drop the connection', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  let status = 502;
+  const pods = fakeSandboxPods(() => fakeResponse(status));
+  const client = new NativeSandboxClient({accountLoader: () => ({authId: 'owner'}), rpc: pods.rpc, fetcher: pods.fetcher});
+  const presence = {agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false};
+  await assert.rejects(client.presence(presence), /^Error: upstream_http_502$/);
+  assert.equal(pods.ensures, 2); assert.equal(pods.hits.length, 2);
+  await assert.rejects(client.probe(), /^Error: upstream_http_502$/);
+  assert.equal(pods.ensures, 4); assert.equal(pods.hits.length, 4);
+  status = 400;
+  await assert.rejects(client.presence(presence), /^Error: upstream_http_400$/);
+  await assert.rejects(client.presence(presence), /^Error: upstream_http_400$/);
+  assert.equal(pods.ensures, 5); assert.equal(pods.hits.length, 6);
+});
+
+test('HTTP /native/health recovers after the cached sandbox connection goes stale', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  let pod1Alive = true;
+  const pods = fakeSandboxPods((pod, path) => {
+    if (pod === 'pod1' && !pod1Alive) return fakeResponse(502);
+    return fakeResponse(200, path === '/events' ? 'text/event-stream' : 'application/json');
+  });
+  const sandbox = new NativeSandboxClient({accountLoader: () => ({authId: 'owner'}), rpc: pods.rpc, fetcher: pods.fetcher, connectMode: 'normal'});
+  const port = await freePort();
+  const server = createBridge({port, agentId: 'a', desktopEnabled: true, toolsEnabled: false, sandbox});
+  await new Promise(r => server.listen(port, '127.0.0.1', r));
+  try {
+    const health = () => fetch(`http://127.0.0.1:${port}/native/health`);
+    assert.equal((await health()).status, 200);
+    pod1Alive = false;
+    const response = await health();
+    assert.equal(response.status, 200);
+    assert.equal(JSON.stringify(await response.json()).includes('FAKE_TOKEN'), false);
+    assert.equal(pods.ensures, 2);
+  } finally { await new Promise(r => server.close(r)); }
+});

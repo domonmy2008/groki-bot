@@ -101,6 +101,11 @@ export function validateSandboxUrl(raw) {
   return url.toString().replace(/\/$/, '');
 }
 
+// Request-shape errors (400/409/422...) are not fixed by a new sandbox connection.
+function isStaleSandboxStatus(status) {
+  return [401, 403, 404, 408, 410, 421].includes(status) || status >= 500;
+}
+
 export class NativeSandboxClient {
   #connection;
   #loading;
@@ -123,28 +128,51 @@ export class NativeSandboxClient {
     })().finally(() => { this.#loading = undefined; });
     return this.#loading;
   }
-  async #fetch(path, options = {}) {
-    const connection = await this.#connect();
-    return this.fetcher(connection.baseUrl + path, {...options, redirect: 'error', headers: {...connection.headers, ...options.headers}});
+  #invalidate(connection) {
+    if (this.#connection === connection) this.#connection = undefined;
+  }
+  // The sandbox gatewayUrl/token can go stale (pod replaced overnight) while the
+  // account login stays valid. Drop the cached connection on stale-looking
+  // failures and re-run EnsureSandBox once per request; never loop.
+  async #fetch(path, options = {}, accept = response => response.ok) {
+    for (let attempt = 0; ; attempt++) {
+      const connection = await this.#connect();
+      let response;
+      try {
+        response = await this.fetcher(connection.baseUrl + path, {...options, redirect: 'error', headers: {...connection.headers, ...options.headers}});
+      } catch (error) {
+        const signal = options.signal;
+        if (signal?.aborted && signal.reason?.name !== 'TimeoutError') throw error;
+        this.#invalidate(connection);
+        if (attempt > 0 || signal?.aborted) throw error;
+        continue;
+      }
+      if (accept(response)) return response;
+      if (!response.ok && !isStaleSandboxStatus(response.status)) return response;
+      this.#invalidate(connection);
+      if (attempt > 0 || options.signal?.aborted) return response;
+      await response.body?.cancel();
+    }
   }
   async openEvents(signal) {
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), 20000);
+    const timer = setTimeout(() => deadline.abort(new DOMException('native_events_timeout', 'TimeoutError')), 20000);
+    const isEventStream = response => response.ok && response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream') === true;
     try {
-      const response = await this.#fetch('/events', {headers: {accept: 'text/event-stream'}, signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal});
-      if (!response.ok || !response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream')) {
+      const response = await this.#fetch('/events', {headers: {accept: 'text/event-stream'}, signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal}, isEventStream);
+      if (!isEventStream(response)) {
         await response.body?.cancel(); throw new Error(`upstream_http_${response.status}`);
       }
       return response;
     } finally { clearTimeout(timer); }
   }
   async probe() {
-    const connection = await this.#connect();
     const health = await this.#fetch('/health', {signal: AbortSignal.timeout(20000)});
     const healthStatus = health.status;
     await health.body?.cancel();
     if (!health.ok) throw new Error(`upstream_http_${healthStatus}`);
     const events = await this.openEvents();
+    const connection = await this.#connect();
     const result = {ok: true, responseFields: connection.responseFields, https: true, hostnameAllowed: true, gatewayTokenPresent: true, networkHeaderPresent: Boolean(connection.headers['x-anyrun-network-token']), healthStatus, eventsStatus: events.status, eventStreamContentTypeOk: true};
     // Handshake only. Do not parse/read the initial snapshot or any messages.
     await events.body?.cancel();
